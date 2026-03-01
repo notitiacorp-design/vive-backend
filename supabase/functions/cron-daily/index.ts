@@ -286,7 +286,8 @@ async function runJarvisForUsers(
   const analyzedUserIds: string[] = [];
 
   const analyzeUser = async (userId: string) => {
-    console.log(`[cron-daily] Calling jarvis-engine for user ${userId}`);
+    const shortId = userId.substring(0, 8);
+    console.log(`[cron-daily] Calling jarvis-engine for user ${shortId}...`);
     const result = await callEdgeFunction(JARVIS_ENGINE_URL, {
       user_id: userId,
       trigger: 'cron_daily',
@@ -295,10 +296,10 @@ async function runJarvisForUsers(
     if (result.ok) {
       analyses_run++;
       analyzedUserIds.push(userId);
-      console.log(`[cron-daily] jarvis-engine succeeded for user ${userId}`);
+      console.log(`[cron-daily] jarvis-engine succeeded for user ${shortId}`);
     } else {
       analyses_failed++;
-      console.error(`[cron-daily] jarvis-engine failed for user ${userId}: ${result.error}`);
+      console.error(`[cron-daily] jarvis-engine failed for user ${shortId}: ${result.error}`);
     }
   };
 
@@ -351,7 +352,7 @@ async function generateMorningBriefings(
   const notifications = Array.from(latestByUser.entries()).map(([userId, analysis]) => ({
     user_id: userId,
     type: 'morning_briefing',
-    title: 'Your Morning Health Briefing',
+    title: '\uD83C\uDF05 Your Morning Health Briefing',
     body: analysis.summary ?? 'Your daily VIVE health analysis is ready. Tap to view your insights.',
     payload: JSON.stringify({
       analysis_score: analysis.score,
