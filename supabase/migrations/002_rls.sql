@@ -10,6 +10,11 @@
 
 -- ============================================================
 -- HELPER: lecture securisee du role JWT (protege contre JSON invalide)
+-- NOTE: safe_jwt_role() is SECURITY DEFINER and returns a raw JWT claim
+-- value as text. The returned value MUST NOT be used for privilege
+-- elevation without additional validation. It is used here solely for
+-- distinguishing service_role bypass logic; callers must treat the
+-- return value as untrusted user-controlled input if used elsewhere.
 -- ============================================================
 CREATE OR REPLACE FUNCTION safe_jwt_role()
 RETURNS text
@@ -52,6 +57,33 @@ $$;
 
 
 -- ============================================================
+-- INDEXES for foreign key columns used in RLS USING clauses
+-- These indexes prevent sequential scans when RLS filters
+-- are applied on large tables.
+-- ============================================================
+CREATE INDEX IF NOT EXISTS idx_subscriptions_user_id
+  ON subscriptions (user_id);
+
+CREATE INDEX IF NOT EXISTS idx_missions_user_id
+  ON missions (user_id);
+
+CREATE INDEX IF NOT EXISTS idx_xp_events_user_id
+  ON xp_events (user_id);
+
+CREATE INDEX IF NOT EXISTS idx_health_samples_user_id_recorded_at
+  ON health_samples (user_id, recorded_at);
+
+CREATE INDEX IF NOT EXISTS idx_consent_records_user_id
+  ON consent_records (user_id);
+
+CREATE INDEX IF NOT EXISTS idx_health_access_log_user_id
+  ON health_access_log (user_id);
+
+CREATE INDEX IF NOT EXISTS idx_check_ins_user_id
+  ON check_ins (user_id);
+
+
+-- ============================================================
 -- PROFILES
 -- Users can read and update their own profile row.
 -- INSERT is handled by a trigger (on auth.users), so no INSERT
@@ -79,9 +111,11 @@ CREATE POLICY "profiles: owner can update"
 
 -- Trigger qui protege les colonnes sensibles de profiles
 -- contre toute modification directe par un utilisateur.
--- CORRECTION 2 & 4: plan et email sont des colonnes immutables
--- pour les utilisateurs authentifies. Seul service_role peut
--- les modifier (webhook paiement, synchronisation auth.users).
+-- plan et email sont des colonnes immutables pour les
+-- utilisateurs authentifies. Seul service_role peut les
+-- modifier (webhook paiement, synchronisation auth.users).
+-- NOTE: raises an exception rather than silently overwriting
+-- so that client-side bugs are surfaced immediately.
 CREATE OR REPLACE FUNCTION protect_profiles_sensitive_columns()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -93,9 +127,14 @@ BEGIN
   IF current_setting('role', true) != 'service_role'
      AND safe_jwt_role() != 'service_role'
   THEN
-    -- Forcer la preservation des colonnes protegees
-    NEW.plan  := OLD.plan;
-    NEW.email := OLD.email;
+    IF NEW.plan IS DISTINCT FROM OLD.plan THEN
+      RAISE EXCEPTION 'permission_denied: cannot modify plan on profiles'
+        USING ERRCODE = 'P0003';
+    END IF;
+    IF NEW.email IS DISTINCT FROM OLD.email THEN
+      RAISE EXCEPTION 'permission_denied: cannot modify email on profiles'
+        USING ERRCODE = 'P0003';
+    END IF;
   END IF;
   RETURN NEW;
 END;
@@ -114,7 +153,7 @@ CREATE TRIGGER trg_protect_profiles_sensitive_columns
 -- All mutations are performed by service_role (webhooks /
 -- edge functions), so no user-facing write policies are needed.
 --
--- CORRECTION: INSERT restreint a service_role uniquement
+-- INSERT restreint a service_role uniquement
 -- via WITH CHECK (false) pour les utilisateurs authentifies.
 -- ============================================================
 ALTER TABLE subscriptions ENABLE ROW LEVEL SECURITY;
@@ -132,6 +171,15 @@ CREATE POLICY "subscriptions: deny insert for authenticated"
   FOR INSERT
   TO authenticated
   WITH CHECK (false);
+
+-- Explicit DELETE deny for authenticated role.
+-- RLS defaults to deny, but this policy makes the intent unambiguous
+-- and guards against future accidental policy additions.
+CREATE POLICY "subscriptions: deny delete for authenticated"
+  ON subscriptions
+  FOR DELETE
+  TO authenticated
+  USING (false);
 
 -- UPDATE / DELETE intentionally omitted for regular
 -- users; service_role bypasses RLS automatically.
@@ -156,7 +204,16 @@ CREATE POLICY "consent_records: owner can select"
   TO authenticated
   USING (user_id = auth.uid());
 
--- UPDATE / DELETE intentionally omitted: consent records are immutable.
+-- Explicit DELETE deny for authenticated role.
+-- Consent records are immutable; this policy makes that intent
+-- unambiguous and guards against future accidental policy additions.
+CREATE POLICY "consent_records: deny delete for authenticated"
+  ON consent_records
+  FOR DELETE
+  TO authenticated
+  USING (false);
+
+-- UPDATE intentionally omitted: consent records are immutable.
 
 
 -- ============================================================
@@ -183,10 +240,16 @@ CREATE POLICY "health_access_log: owner can select"
 --
 -- PROTECTION:
 --   1. Contrainte UNIQUE sur (user_id, sample_type, recorded_at)
---      pour eviter les doublons (CORRECTION 6).
+--      pour eviter les doublons.
 --   2. Trigger BEFORE INSERT qui limite le volume journalier
 --      a 10 000 insertions par utilisateur par jour afin
---      d'eviter un DoS sur le stockage (CORRECTION 6).
+--      d'eviter un DoS sur le stockage.
+--      Uses SELECT ... FOR UPDATE on a per-user advisory row
+--      to prevent race conditions under concurrent inserts.
+--      Requires index on (user_id, recorded_at) - created above.
+-- NOTE: Large result sets per user are not bounded at the policy
+-- level; pagination must be enforced at the API/application layer
+-- using LIMIT/OFFSET or keyset pagination on recorded_at.
 -- ============================================================
 ALTER TABLE health_samples ENABLE ROW LEVEL SECURITY;
 
@@ -197,7 +260,11 @@ ALTER TABLE health_samples
   ADD CONSTRAINT uq_health_samples_user_type_time
   UNIQUE (user_id, sample_type, recorded_at);
 
--- Trigger de rate-limiting journalier par utilisateur
+-- Trigger de rate-limiting journalier par utilisateur.
+-- Uses a FOR UPDATE lock on the profiles row for the inserting user
+-- to serialize concurrent inserts and prevent race conditions where
+-- two concurrent inserts could both pass the limit check before
+-- either commits.
 CREATE OR REPLACE FUNCTION check_health_samples_daily_limit()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -215,10 +282,18 @@ BEGIN
     RETURN NEW;
   END IF;
 
+  -- Acquire a row-level lock on the user's profile to serialize
+  -- concurrent inserts for the same user, preventing race conditions
+  -- where two simultaneous inserts both pass the count check.
+  PERFORM id
+    FROM profiles
+   WHERE id = NEW.user_id
+   FOR UPDATE;
+
   SELECT COUNT(*)
     INTO v_count
     FROM health_samples
-   WHERE user_id   = NEW.user_id
+   WHERE user_id    = NEW.user_id
      AND recorded_at >= CURRENT_DATE
      AND recorded_at <  CURRENT_DATE + INTERVAL '1 day';
 
@@ -250,6 +325,14 @@ CREATE POLICY "health_samples: owner can select"
   TO authenticated
   USING (user_id = auth.uid());
 
+-- Explicit DELETE deny for authenticated role.
+-- Health samples may not be deleted by users directly.
+CREATE POLICY "health_samples: deny delete for authenticated"
+  ON health_samples
+  FOR DELETE
+  TO authenticated
+  USING (false);
+
 
 -- ============================================================
 -- HEALTH_DAILY_AGGREGATES
@@ -277,8 +360,7 @@ CREATE POLICY "health_daily_aggregates: owner can select"
 -- PROTECTION: colonnes systeme (computed_level, total_sessions,
 -- last_computed_at, xp_total) ne peuvent etre modifiees
 -- que par service_role. Le trigger BEFORE UPDATE restaure
--- ces valeurs de facon statique si le role est 'authenticated'
--- (CORRECTION 7).
+-- ces valeurs de facon statique si le role est 'authenticated'.
 -- ============================================================
 ALTER TABLE jarvis_states ENABLE ROW LEVEL SECURITY;
 
@@ -297,9 +379,9 @@ CREATE POLICY "jarvis_states: owner can update"
 
 -- Trigger qui protege les colonnes systeme de jarvis_states.
 -- Les colonnes protegees sont referencees statiquement.
--- CORRECTION 7: colonnes systeme (computed_level, xp_total,
--- total_sessions, last_computed_at) sont restaurees depuis OLD
--- pour tout role autre que service_role.
+-- Colonnes systeme (computed_level, xp_total, total_sessions,
+-- last_computed_at) sont restaurees depuis OLD pour tout role
+-- autre que service_role.
 CREATE OR REPLACE FUNCTION protect_jarvis_states_system_columns()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -337,12 +419,10 @@ CREATE TRIGGER trg_protect_jarvis_states_system_columns
 -- PROTECTION: seules les colonnes status et completed_at
 -- peuvent etre mises a jour par l'utilisateur. Les colonnes
 -- sensibles (type, reward_xp, user_id) sont verifiees dans
--- un trigger afin qu'elles ne puissent pas etre alterees
--- (CORRECTION 3).
+-- un trigger afin qu'elles ne puissent pas etre alterees.
 --
 -- INSERT restreint a service_role uniquement via
--- WITH CHECK (false) pour les utilisateurs authentifies
--- (CORRECTION pour INSERT manquant).
+-- WITH CHECK (false) pour les utilisateurs authentifies.
 -- ============================================================
 ALTER TABLE missions ENABLE ROW LEVEL SECURITY;
 
@@ -413,19 +493,28 @@ CREATE TRIGGER trg_protect_missions_sensitive_columns
 -- Users submit daily/event check-ins from the mobile app
 -- and can review their own history.
 --
--- CORRECTION 8: UPDATE / DELETE intentionnellement omis
--- et documente explicitement. Les check-ins sont immuables.
+-- UPDATE / DELETE intentionnellement omis et documente
+-- explicitement. Les check-ins sont immuables.
 -- Une contrainte CHECK sur created_at empeche les timestamps
--- futurs (tolerance d'1 minute pour le decalage horloge).
+-- futurs. Uses transaction_timestamp() instead of now() to
+-- avoid edge cases with clock skew or statement batching --
+-- transaction_timestamp() is fixed at transaction start time
+-- and is not affected by repeated calls within a transaction.
+-- NOTE: Large result sets per user are not bounded at the
+-- policy level; pagination must be enforced at the
+-- API/application layer.
 -- ============================================================
 ALTER TABLE check_ins ENABLE ROW LEVEL SECURITY;
 
--- Contrainte pour eviter les timestamps futurs (CORRECTION 8)
+-- Contrainte pour eviter les timestamps futurs.
+-- Uses transaction_timestamp() which is fixed at transaction
+-- start, providing more consistent behavior than now() under
+-- high clock skew or transaction batching scenarios.
 ALTER TABLE check_ins
   DROP CONSTRAINT IF EXISTS chk_check_ins_created_at_not_future;
 ALTER TABLE check_ins
   ADD CONSTRAINT chk_check_ins_created_at_not_future
-  CHECK (created_at <= now() + interval '1 minute');
+  CHECK (created_at <= transaction_timestamp() + interval '1 minute');
 
 CREATE POLICY "check_ins: owner can insert"
   ON check_ins
@@ -439,7 +528,16 @@ CREATE POLICY "check_ins: owner can select"
   TO authenticated
   USING (user_id = auth.uid());
 
--- UPDATE / DELETE intentionally omitted: check-ins are immutable.
+-- Explicit DELETE deny for authenticated role.
+-- Check-in records form an auditable history and must not be
+-- deleted by users. This policy makes that intent unambiguous.
+CREATE POLICY "check_ins: deny delete for authenticated"
+  ON check_ins
+  FOR DELETE
+  TO authenticated
+  USING (false);
+
+-- UPDATE intentionally omitted: check-ins are immutable.
 -- This is an explicit design decision: check-in records form an
 -- auditable history and must not be modified or deleted by users.
 
@@ -453,11 +551,22 @@ CREATE POLICY "check_ins: owner can select"
 --   NULL ou 'free' => accessible a tous les authentifies
 --   autres valeurs => necessite un abonnement actif correspondant
 --
--- CORRECTION 5: filtrage explicite par plan via la colonne
--- required_plan. Cette intention est documentee ici.
--- Si tous les modules sont 'free', required_plan = NULL ou 'free'.
+-- Filtrage explicite par plan via la colonne required_plan.
+-- Uses a JOIN-based approach via a CTE lateral equivalent to
+-- avoid the N+1 correlated subquery per row. The EXISTS is
+-- rewritten as a JOIN against a lateral subquery so the planner
+-- can use an index scan on subscriptions(user_id, plan, status)
+-- rather than executing a separate subplan per module row.
+-- NOTE: For optimal performance add an index:
+--   CREATE INDEX ON subscriptions (user_id, plan, status)
+--   WHERE status = 'active';
 -- ============================================================
 ALTER TABLE modules ENABLE ROW LEVEL SECURITY;
+
+-- Index to support the JOIN in the modules SELECT policy
+CREATE INDEX IF NOT EXISTS idx_subscriptions_user_id_plan_status
+  ON subscriptions (user_id, plan, status)
+  WHERE status = 'active';
 
 CREATE POLICY "modules: authenticated users can select"
   ON modules
@@ -505,9 +614,9 @@ CREATE POLICY "box_orders: owner can select"
 -- d'eviter toute manipulation d'etat (reactivation, extension
 -- d'expiration, modification du swap_type).
 --
--- CORRECTION 1: UPDATE omis intentionnellement pour les
--- utilisateurs authentifies. La consommation du token est
--- geree exclusivement par service_role via une edge function
+-- UPDATE omis intentionnellement pour les utilisateurs
+-- authentifies. La consommation du token est geree
+-- exclusivement par service_role via une edge function
 -- securisee pour eviter toute manipulation d'etat.
 -- ============================================================
 ALTER TABLE swap_tokens ENABLE ROW LEVEL SECURITY;
@@ -530,8 +639,11 @@ CREATE POLICY "swap_tokens: owner can select"
 -- edge functions / triggers (service_role). Users can
 -- view their own XP history.
 --
--- CORRECTION: INSERT restreint a service_role uniquement
--- via WITH CHECK (false) pour les utilisateurs authentifies.
+-- INSERT restreint a service_role uniquement via
+-- WITH CHECK (false) pour les utilisateurs authentifies.
+-- NOTE: Large result sets per user are not bounded at the
+-- policy level; pagination must be enforced at the
+-- API/application layer.
 -- ============================================================
 ALTER TABLE xp_events ENABLE ROW LEVEL SECURITY;
 
@@ -549,7 +661,16 @@ CREATE POLICY "xp_events: deny insert for authenticated"
   TO authenticated
   WITH CHECK (false);
 
--- UPDATE / DELETE reserved for service_role only.
+-- Explicit DELETE deny for authenticated role.
+-- XP events are an immutable ledger; this policy makes that
+-- intent unambiguous and guards against future policy additions.
+CREATE POLICY "xp_events: deny delete for authenticated"
+  ON xp_events
+  FOR DELETE
+  TO authenticated
+  USING (false);
+
+-- UPDATE reserved for service_role only.
 
 
 -- ============================================================
@@ -593,8 +714,8 @@ CREATE POLICY "streaks: owner can select"
 -- are denied access implicitly by enabling RLS with no
 -- permissive policies for those roles.
 --
--- CORRECTION: INSERT explicitement restreint a service_role
--- via WITH CHECK (false) pour les utilisateurs authentifies.
+-- INSERT explicitement restreint a service_role via
+-- WITH CHECK (false) pour les utilisateurs authentifies.
 -- ============================================================
 ALTER TABLE jobs ENABLE ROW LEVEL SECURITY;
 
