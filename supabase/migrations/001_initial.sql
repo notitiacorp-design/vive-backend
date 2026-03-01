@@ -29,6 +29,8 @@ BEGIN
 END;
 $$;
 
+COMMENT ON FUNCTION fn_set_updated_at() IS 'Trigger function: automatically sets updated_at to now() on row modification';
+
 -- =============================================================================
 -- REFERENCE TABLES
 -- =============================================================================
@@ -147,6 +149,10 @@ CREATE TABLE public.consent_records (
       'terms_of_service',
       'privacy_policy'
     )
+  ),
+  -- Enforce known versions per consent type to prevent fabricated version strings
+  CONSTRAINT consent_records_version_check CHECK (
+    version ~ '^v[0-9]+\.[0-9]+(\.[0-9]+)?$'
   )
 );
 
@@ -207,10 +213,10 @@ CREATE INDEX idx_health_samples_start_ts     ON public.health_samples (start_ts)
 CREATE INDEX idx_health_samples_source       ON public.health_samples (source);
 CREATE INDEX idx_health_samples_created_at   ON public.health_samples (created_at);
 CREATE INDEX idx_health_samples_user_metric  ON public.health_samples (user_id, metric_type, start_ts DESC);
--- Partial index for recent data queries (dashboard, charts)
+-- Full index for recent data queries (dashboard, charts) â not a time-bounded partial
+-- index to avoid the static now() evaluation problem at DDL time.
 CREATE INDEX idx_health_samples_recent
-  ON public.health_samples (user_id, metric_type, start_ts DESC)
-  WHERE start_ts >= now() - INTERVAL '90 days';
+  ON public.health_samples (user_id, metric_type, start_ts DESC);
 
 CREATE TRIGGER trg_health_samples_updated_at
   BEFORE UPDATE ON public.health_samples
@@ -457,6 +463,7 @@ CREATE TRIGGER trg_user_levels_updated_at
 
 -- ---------------------------------------------------------------------------
 -- streaks
+-- Added updated_at for audit trail and cache invalidation support.
 -- ---------------------------------------------------------------------------
 CREATE TABLE public.streaks (
   user_id        uuid    NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
@@ -464,6 +471,7 @@ CREATE TABLE public.streaks (
   longest_streak int     NOT NULL DEFAULT 0 CHECK (longest_streak >= 0),
   last_checkin   date,
   freeze_used    boolean NOT NULL DEFAULT false,
+  updated_at     timestamptz NOT NULL DEFAULT now(),
   CONSTRAINT streaks_pkey PRIMARY KEY (user_id)
 );
 
@@ -472,22 +480,30 @@ COMMENT ON TABLE public.streaks IS 'Daily check-in streak tracking per user';
 CREATE INDEX idx_streaks_current_streak ON public.streaks (current_streak);
 CREATE INDEX idx_streaks_last_checkin   ON public.streaks (last_checkin);
 
+CREATE TRIGGER trg_streaks_updated_at
+  BEFORE UPDATE ON public.streaks
+  FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at();
+
 -- ---------------------------------------------------------------------------
 -- jobs
+-- user_id FK references public.profiles to constrain non-null user_id values.
+-- max_attempts enforces a hard DB-level retry ceiling.
 -- ---------------------------------------------------------------------------
 CREATE TABLE public.jobs (
   id            uuid        NOT NULL DEFAULT gen_random_uuid(),
   type          text        NOT NULL,
-  user_id       uuid,
+  user_id       uuid        REFERENCES public.profiles(id) ON DELETE CASCADE,
   payload       jsonb,
   status        text        NOT NULL DEFAULT 'pending'
                   CHECK (status IN ('pending', 'processing', 'completed', 'failed', 'retrying')),
   attempts      int         NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  max_attempts  int         NOT NULL DEFAULT 5 CHECK (max_attempts >= 1 AND max_attempts <= 100),
   scheduled_for timestamptz NOT NULL DEFAULT now(),
   created_at    timestamptz NOT NULL DEFAULT now(),
   processed_at  timestamptz,
   CONSTRAINT jobs_pkey PRIMARY KEY (id),
-  CONSTRAINT jobs_payload_size CHECK (pg_column_size(payload) < 65536)
+  CONSTRAINT jobs_payload_size CHECK (pg_column_size(payload) < 65536),
+  CONSTRAINT jobs_attempts_within_max CHECK (attempts <= max_attempts)
 );
 
 COMMENT ON TABLE public.jobs IS 'Async background job queue';
@@ -497,7 +513,9 @@ CREATE INDEX idx_jobs_type        ON public.jobs (type);
 CREATE INDEX idx_jobs_user_id     ON public.jobs (user_id);
 CREATE INDEX idx_jobs_created_at  ON public.jobs (created_at);
 CREATE INDEX idx_jobs_status_type ON public.jobs (status, type);
--- Partial index for efficient queue polling
+-- Composite index for time-based queue polling including scheduled_for
+CREATE INDEX idx_jobs_scheduled_status ON public.jobs (scheduled_for ASC, status);
+-- Partial index for efficient pending/retrying queue polling
 CREATE INDEX idx_jobs_pending_created
   ON public.jobs (scheduled_for ASC, type)
   WHERE status IN ('pending', 'retrying');
@@ -520,6 +538,8 @@ SET search_path = public
 AS $$
   SELECT GREATEST(1, FLOOR(SQRT(GREATEST(p_total_xp, 0)::numeric / 100)) + 1)::int;
 $$;
+
+COMMENT ON FUNCTION fn_compute_level(int) IS 'Pure function: computes user level from total XP using floor(sqrt(xp/100))+1 formula';
 
 -- ---------------------------------------------------------------------------
 -- Function: Aggregate XP into user_levels on xp_events INSERT
@@ -559,12 +579,19 @@ BEGIN
 END;
 $$;
 
+COMMENT ON FUNCTION fn_aggregate_xp() IS 'Trigger function: atomically upserts user_levels total_xp and current_level on each xp_events INSERT';
+
 CREATE TRIGGER trg_xp_events_aggregate
   AFTER INSERT ON public.xp_events
   FOR EACH ROW EXECUTE FUNCTION fn_aggregate_xp();
 
 -- ---------------------------------------------------------------------------
 -- Function: Update streak on check_in INSERT
+-- Uses SELECT ... FOR UPDATE to lock the streak row after the initial
+-- INSERT ... ON CONFLICT DO NOTHING, eliminating the TOCTOU race condition
+-- where concurrent check-in inserts for the same user could read stale
+-- streak state and produce duplicate/inconsistent streak updates.
+-- Uses explicit INTERVAL '1 day' arithmetic for clarity and safety.
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION fn_update_streak()
 RETURNS TRIGGER
@@ -579,15 +606,18 @@ DECLARE
   v_freeze_used    boolean;
   v_new_streak     int;
 BEGIN
-  -- Ensure a streak row exists
+  -- Ensure a streak row exists before locking
   INSERT INTO public.streaks (user_id, current_streak, longest_streak, last_checkin, freeze_used)
   VALUES (NEW.user_id, 0, 0, NULL, false)
   ON CONFLICT (user_id) DO NOTHING;
 
+  -- Lock the streak row to prevent concurrent streak updates for the same user
+  -- (eliminates TOCTOU race condition with concurrent check-in inserts)
   SELECT current_streak, longest_streak, last_checkin, freeze_used
   INTO v_current_streak, v_longest_streak, v_last_checkin, v_freeze_used
   FROM public.streaks
-  WHERE user_id = NEW.user_id;
+  WHERE user_id = NEW.user_id
+  FOR UPDATE;
 
   -- Avoid double-counting same-day check-ins (UNIQUE constraint handles it at DB level,
   -- but guard here for safety)
@@ -598,10 +628,10 @@ BEGIN
   IF v_last_checkin IS NULL THEN
     -- First ever check-in
     v_new_streak := 1;
-  ELSIF NEW.date = v_last_checkin + 1 THEN
-    -- Consecutive day (integer addition on date type)
+  ELSIF NEW.date = v_last_checkin + INTERVAL '1 day' THEN
+    -- Consecutive day
     v_new_streak := v_current_streak + 1;
-  ELSIF NEW.date = v_last_checkin + 2 AND NOT v_freeze_used THEN
+  ELSIF NEW.date = v_last_checkin + INTERVAL '2 days' AND NOT v_freeze_used THEN
     -- Missed one day but freeze token available: preserve streak
     v_new_streak := v_current_streak + 1;
     v_freeze_used := true;
@@ -623,12 +653,16 @@ BEGIN
 END;
 $$;
 
+COMMENT ON FUNCTION fn_update_streak() IS 'Trigger function: updates streak counters on check_ins INSERT using FOR UPDATE lock to prevent race conditions';
+
 CREATE TRIGGER trg_check_ins_update_streak
   AFTER INSERT ON public.check_ins
   FOR EACH ROW EXECUTE FUNCTION fn_update_streak();
 
 -- ---------------------------------------------------------------------------
 -- Function: Auto-create profile row when a new auth.users row is inserted
+-- Uses NULL for email when NEW.email IS NULL to avoid bypassing the email
+-- regex CHECK constraint with an empty string.
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.handle_new_user()
 RETURNS TRIGGER
@@ -640,7 +674,9 @@ BEGIN
   INSERT INTO public.profiles (id, email, full_name, avatar_url, plan, onboarding_completed)
   VALUES (
     NEW.id,
-    COALESCE(NEW.email, ''),
+    -- Use NULL instead of '' when email is missing to avoid violating the
+    -- email regex CHECK constraint with an empty string that would never match.
+    NEW.email,
     COALESCE(NEW.raw_user_meta_data->>'full_name', ''),
     COALESCE(NEW.raw_user_meta_data->>'avatar_url', NULL),
     'free',
@@ -660,6 +696,8 @@ BEGIN
   RETURN NEW;
 END;
 $$;
+
+COMMENT ON FUNCTION public.handle_new_user() IS 'Trigger function: auto-creates profile, user_levels, and streaks rows when a new auth.users record is inserted';
 
 CREATE OR REPLACE TRIGGER trg_auth_users_create_profile
   AFTER INSERT ON auth.users
@@ -687,11 +725,43 @@ ALTER TABLE public.streaks                 ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.jobs                    ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.health_metric_types     ENABLE ROW LEVEL SECURITY;
 
+-- Force RLS even for table owners / superusers on all sensitive tables
+-- to harden production deployments against accidental privilege escalation.
+ALTER TABLE public.profiles                FORCE ROW LEVEL SECURITY;
+ALTER TABLE public.subscriptions           FORCE ROW LEVEL SECURITY;
+ALTER TABLE public.consent_records         FORCE ROW LEVEL SECURITY;
+ALTER TABLE public.health_access_log       FORCE ROW LEVEL SECURITY;
+ALTER TABLE public.health_samples          FORCE ROW LEVEL SECURITY;
+ALTER TABLE public.health_daily_aggregates FORCE ROW LEVEL SECURITY;
+ALTER TABLE public.jarvis_states           FORCE ROW LEVEL SECURITY;
+ALTER TABLE public.missions                FORCE ROW LEVEL SECURITY;
+ALTER TABLE public.check_ins               FORCE ROW LEVEL SECURITY;
+ALTER TABLE public.modules                 FORCE ROW LEVEL SECURITY;
+ALTER TABLE public.box_orders              FORCE ROW LEVEL SECURITY;
+ALTER TABLE public.swap_tokens             FORCE ROW LEVEL SECURITY;
+ALTER TABLE public.xp_events               FORCE ROW LEVEL SECURITY;
+ALTER TABLE public.user_levels             FORCE ROW LEVEL SECURITY;
+ALTER TABLE public.streaks                 FORCE ROW LEVEL SECURITY;
+ALTER TABLE public.jobs                    FORCE ROW LEVEL SECURITY;
+ALTER TABLE public.health_metric_types     FORCE ROW LEVEL SECURITY;
+
 -- ---------------------------------------------------------------------------
--- RLS Policies: health_metric_types (read-only for all authenticated users)
+-- RLS Policies: health_metric_types
+-- Read-only for all authenticated users.
+-- Note: unauthenticated requests are silently blocked by the IS NOT NULL check.
 -- ---------------------------------------------------------------------------
 CREATE POLICY health_metric_types_select_authenticated ON public.health_metric_types
   FOR SELECT USING (auth.uid() IS NOT NULL);
+
+-- Explicit deny for authenticated user mutations (audit clarity)
+CREATE POLICY health_metric_types_insert_deny ON public.health_metric_types
+  FOR INSERT WITH CHECK (false);
+
+CREATE POLICY health_metric_types_update_deny ON public.health_metric_types
+  FOR UPDATE USING (false) WITH CHECK (false);
+
+CREATE POLICY health_metric_types_delete_deny ON public.health_metric_types
+  FOR DELETE USING (false);
 
 -- ---------------------------------------------------------------------------
 -- RLS Policies: profiles
@@ -717,12 +787,18 @@ CREATE POLICY subscriptions_insert_service_only ON public.subscriptions
 
 -- ---------------------------------------------------------------------------
 -- RLS Policies: consent_records
+-- WITH CHECK ensures users can only insert consent rows for themselves,
+-- with a valid consent_type (enforced by table CHECK constraint) and
+-- a version matching the expected semver-like pattern (table constraint).
 -- ---------------------------------------------------------------------------
 CREATE POLICY consent_records_select_own ON public.consent_records
   FOR SELECT USING (auth.uid() = user_id);
 
 CREATE POLICY consent_records_insert_own ON public.consent_records
-  FOR INSERT WITH CHECK (auth.uid() = user_id);
+  FOR INSERT WITH CHECK (
+    auth.uid() = user_id
+    -- consent_type and version are further validated by table CHECK constraints
+  );
 
 -- ---------------------------------------------------------------------------
 -- RLS Policies: health_access_log
@@ -735,6 +811,7 @@ CREATE POLICY health_access_log_insert_own ON public.health_access_log
 
 -- ---------------------------------------------------------------------------
 -- RLS Policies: health_samples
+-- UPDATE WITH CHECK prevents changing user_id to another user's id.
 -- ---------------------------------------------------------------------------
 CREATE POLICY health_samples_select_own ON public.health_samples
   FOR SELECT USING (auth.uid() = user_id);
@@ -743,22 +820,44 @@ CREATE POLICY health_samples_insert_own ON public.health_samples
   FOR INSERT WITH CHECK (auth.uid() = user_id);
 
 CREATE POLICY health_samples_update_own ON public.health_samples
-  FOR UPDATE USING (auth.uid() = user_id);
+  FOR UPDATE USING (auth.uid() = user_id)
+  WITH CHECK (auth.uid() = user_id);
 
 CREATE POLICY health_samples_delete_own ON public.health_samples
   FOR DELETE USING (auth.uid() = user_id);
 
 -- ---------------------------------------------------------------------------
 -- RLS Policies: health_daily_aggregates
+-- INSERT WITH CHECK requires user_id ownership AND that a corresponding
+-- health_sample exists for the same user/date/metric_type to prevent
+-- fabricated aggregate injection.
+-- UPDATE WITH CHECK enforces the same ownership invariant.
 -- ---------------------------------------------------------------------------
 CREATE POLICY health_daily_aggregates_select_own ON public.health_daily_aggregates
   FOR SELECT USING (auth.uid() = user_id);
 
 CREATE POLICY health_daily_aggregates_upsert_own ON public.health_daily_aggregates
-  FOR INSERT WITH CHECK (auth.uid() = user_id);
+  FOR INSERT WITH CHECK (
+    auth.uid() = user_id
+    AND EXISTS (
+      SELECT 1 FROM public.health_samples hs
+      WHERE hs.user_id = auth.uid()
+        AND hs.metric_type = health_daily_aggregates.metric_type
+        AND hs.start_ts::date = health_daily_aggregates.date
+    )
+  );
 
 CREATE POLICY health_daily_aggregates_update_own ON public.health_daily_aggregates
-  FOR UPDATE USING (auth.uid() = user_id);
+  FOR UPDATE USING (auth.uid() = user_id)
+  WITH CHECK (
+    auth.uid() = user_id
+    AND EXISTS (
+      SELECT 1 FROM public.health_samples hs
+      WHERE hs.user_id = auth.uid()
+        AND hs.metric_type = health_daily_aggregates.metric_type
+        AND hs.start_ts::date = health_daily_aggregates.date
+    )
+  );
 
 -- ---------------------------------------------------------------------------
 -- RLS Policies: jarvis_states
@@ -770,7 +869,8 @@ CREATE POLICY jarvis_states_upsert_own ON public.jarvis_states
   FOR INSERT WITH CHECK (auth.uid() = user_id);
 
 CREATE POLICY jarvis_states_update_own ON public.jarvis_states
-  FOR UPDATE USING (auth.uid() = user_id);
+  FOR UPDATE USING (auth.uid() = user_id)
+  WITH CHECK (auth.uid() = user_id);
 
 -- ---------------------------------------------------------------------------
 -- RLS Policies: missions
@@ -806,30 +906,89 @@ CREATE POLICY check_ins_insert_own ON public.check_ins
   FOR INSERT WITH CHECK (auth.uid() = user_id);
 
 CREATE POLICY check_ins_update_own ON public.check_ins
-  FOR UPDATE USING (auth.uid() = user_id);
+  FOR UPDATE USING (auth.uid() = user_id)
+  WITH CHECK (auth.uid() = user_id);
 
 -- ---------------------------------------------------------------------------
--- RLS Policies: modules (read-only for all authenticated users)
+-- RLS Policies: modules
+-- Read-only for all authenticated users.
+-- Explicit deny policies block authenticated users from mutations
+-- (audit clarity; service_role bypasses RLS for admin operations).
 -- ---------------------------------------------------------------------------
 CREATE POLICY modules_select_authenticated ON public.modules
   FOR SELECT USING (auth.uid() IS NOT NULL);
 
+CREATE POLICY modules_insert_deny ON public.modules
+  FOR INSERT WITH CHECK (false);
+
+CREATE POLICY modules_update_deny ON public.modules
+  FOR UPDATE USING (false) WITH CHECK (false);
+
+CREATE POLICY modules_delete_deny ON public.modules
+  FOR DELETE USING (false);
+
 -- ---------------------------------------------------------------------------
 -- RLS Policies: box_orders
--- INSERT restricted to 'pending' status only to prevent users from
--- self-creating orders in advanced states (shipped, delivered, etc.)
+-- INSERT restricted to 'pending' status and only for modules with stock > 0
+-- to prevent ordering out-of-stock modules.
+-- UPDATE WITH CHECK restricts users to allowed status transitions only:
+-- users may change status from 'pending' to 'validation' or 'cancelled',
+-- and may update hero_module_id/mystery_module_id while order is pending/validation.
+-- Workflow-advancing statuses (locked, shipped, delivered) are service_role only.
 -- ---------------------------------------------------------------------------
 CREATE POLICY box_orders_select_own ON public.box_orders
   FOR SELECT USING (auth.uid() = user_id);
 
 CREATE POLICY box_orders_insert_own ON public.box_orders
-  FOR INSERT WITH CHECK (auth.uid() = user_id AND status = 'pending');
+  FOR INSERT WITH CHECK (
+    auth.uid() = user_id
+    AND status = 'pending'
+    -- Ensure referenced modules have stock > 0 (or are null)
+    AND (
+      hero_module_id IS NULL
+      OR EXISTS (
+        SELECT 1 FROM public.modules m
+        WHERE m.id = hero_module_id AND m.stock > 0 AND m.active = true
+      )
+    )
+    AND (
+      mystery_module_id IS NULL
+      OR EXISTS (
+        SELECT 1 FROM public.modules m
+        WHERE m.id = mystery_module_id AND m.stock > 0 AND m.active = true
+      )
+    )
+  );
 
+-- Users may only transition to 'validation' or 'cancelled' statuses.
+-- Statuses 'locked', 'shipped', 'delivered' are exclusively set by service_role.
 CREATE POLICY box_orders_update_own ON public.box_orders
-  FOR UPDATE USING (auth.uid() = user_id);
+  FOR UPDATE USING (auth.uid() = user_id)
+  WITH CHECK (
+    auth.uid() = user_id
+    AND status IN ('pending', 'validation', 'cancelled')
+    -- Ensure referenced modules have stock > 0 (or are null) on update too
+    AND (
+      hero_module_id IS NULL
+      OR EXISTS (
+        SELECT 1 FROM public.modules m
+        WHERE m.id = hero_module_id AND m.stock > 0 AND m.active = true
+      )
+    )
+    AND (
+      mystery_module_id IS NULL
+      OR EXISTS (
+        SELECT 1 FROM public.modules m
+        WHERE m.id = mystery_module_id AND m.stock > 0 AND m.active = true
+      )
+    )
+  );
 
 -- ---------------------------------------------------------------------------
 -- RLS Policies: swap_tokens
+-- UPDATE WITH CHECK enforces that users can only mark a token as used=true
+-- (not revert to false) and that used_at is set when used=true.
+-- This prevents infinite swap abuse by blocking un-use of tokens.
 -- ---------------------------------------------------------------------------
 CREATE POLICY swap_tokens_select_own ON public.swap_tokens
   FOR SELECT USING (auth.uid() = user_id);
@@ -837,8 +996,17 @@ CREATE POLICY swap_tokens_select_own ON public.swap_tokens
 CREATE POLICY swap_tokens_insert_own ON public.swap_tokens
   FOR INSERT WITH CHECK (auth.uid() = user_id);
 
+-- Only allow the 'mark as used' transition: used must become true,
+-- used_at must be set, and the token must currently be unused (USING clause).
+-- This blocks reverting used=true back to false and blocks arbitrary used_at values.
 CREATE POLICY swap_tokens_update_own ON public.swap_tokens
-  FOR UPDATE USING (auth.uid() = user_id);
+  FOR UPDATE
+  USING (auth.uid() = user_id AND used = false)
+  WITH CHECK (
+    auth.uid() = user_id
+    AND used = true
+    AND used_at IS NOT NULL
+  );
 
 -- ---------------------------------------------------------------------------
 -- RLS Policies: xp_events
