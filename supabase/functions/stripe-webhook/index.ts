@@ -1,5 +1,5 @@
-import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.43.1";
 
 // Validation des variables d'environnement au dÃ©marrage
 const STRIPE_WEBHOOK_SECRET = Deno.env.get("STRIPE_WEBHOOK_SECRET");
@@ -9,11 +9,8 @@ const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
 if (!STRIPE_WEBHOOK_SECRET) {
   throw new Error("Missing required environment variable: STRIPE_WEBHOOK_SECRET");
 }
-if (!SUPABASE_URL) {
-  throw new Error("Missing required environment variable: SUPABASE_URL");
-}
-if (!SUPABASE_SERVICE_ROLE_KEY) {
-  throw new Error("Missing required environment variable: SUPABASE_SERVICE_ROLE_KEY");
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+  throw new Error("Missing required environment variables: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY");
 }
 
 async function verifyStripeSignature(
@@ -124,11 +121,11 @@ async function handlePaymentIntentSucceeded(
 
   if (error) {
     console.error("Error upserting box_order for payment_intent.succeeded:", error);
-    throw new Error(`Failed to create box_order: ${error.message}`);
+    throw new Error("Failed to create box_order");
   }
 
   console.log(
-    `box_order upserted successfully for user ${userId}, payment_intent ${paymentIntent.id}`
+    `box_order upserted successfully for payment_intent [redacted]`
   );
 }
 
@@ -165,11 +162,11 @@ async function handleCheckoutSessionCompleted(
 
   if (error) {
     console.error("Error upserting box_order for checkout.session.completed:", error);
-    throw new Error(`Failed to create box_order: ${error.message}`);
+    throw new Error("Failed to create box_order");
   }
 
   console.log(
-    `box_order upserted successfully for user ${userId}, checkout session ${session.id}`
+    `box_order upserted successfully for checkout session [redacted]`
   );
 }
 
@@ -184,9 +181,7 @@ async function handlePaymentIntentPaymentFailed(
 
   console.error("payment_intent.payment_failed:", {
     id: paymentIntent.id,
-    user_id: userId ?? "unknown",
     error_code: lastPaymentError?.code,
-    error_message: lastPaymentError?.message,
     error_type: lastPaymentError?.type,
   });
 
@@ -198,7 +193,7 @@ async function handlePaymentIntentPaymentFailed(
 
   if (selectError) {
     console.error("Error querying box_order for payment_intent.payment_failed:", selectError);
-    throw new Error(`Failed to query box_order: ${selectError.message}`);
+    throw new Error("Failed to query box_order");
   }
 
   if (existing) {
@@ -214,14 +209,14 @@ async function handlePaymentIntentPaymentFailed(
 
     if (error) {
       console.error("Error updating box_order status to payment_failed:", error);
-      throw new Error(`Failed to update box_order: ${error.message}`);
+      throw new Error("Failed to update box_order");
     } else {
-      console.log(`box_order ${existing.id} updated to payment_failed`);
+      console.log(`box_order updated to payment_failed`);
     }
   } else {
     // Aucune commande prÃ©existante : crÃ©er un enregistrement pour conserver la trace
     console.warn(
-      `No existing box_order found for failed payment_intent ${paymentIntent.id}; creating failure record`
+      `No existing box_order found for failed payment_intent; creating failure record`
     );
 
     const { error } = await supabase.from("box_orders").insert({
@@ -238,10 +233,10 @@ async function handlePaymentIntentPaymentFailed(
 
     if (error) {
       console.error("Error inserting failure record for payment_intent.payment_failed:", error);
-      throw new Error(`Failed to insert failure record: ${error.message}`);
+      throw new Error("Failed to insert failure record");
     } else {
       console.log(
-        `Failure record created for payment_intent ${paymentIntent.id}, user ${userId ?? "unknown"}`
+        `Failure record created for payment_intent [redacted]`
       );
     }
   }
@@ -256,7 +251,7 @@ async function handleSubscriptionUpsert(
   const userId = metadata.user_id ?? null;
   const customerId = subscription.customer as string | null;
 
-  console.log(`Handling subscription upsert: ${subscription.id}, customer: ${customerId}`);
+  console.log(`Handling subscription upsert: [redacted]`);
 
   const { error } = await supabase.from("subscriptions").upsert(
     {
@@ -283,10 +278,10 @@ async function handleSubscriptionUpsert(
 
   if (error) {
     console.error("Error upserting subscription:", error);
-    throw new Error(`Failed to upsert subscription: ${error.message}`);
+    throw new Error("Failed to upsert subscription");
   }
 
-  console.log(`Subscription ${subscription.id} upserted successfully`);
+  console.log(`Subscription upserted successfully`);
 }
 
 async function handleSubscriptionDeleted(
@@ -294,7 +289,7 @@ async function handleSubscriptionDeleted(
   subscription: Record<string, unknown>,
   stripeEventId: string
 ): Promise<void> {
-  console.log(`Handling subscription deleted: ${subscription.id}`);
+  console.log(`Handling subscription deleted: [redacted]`);
 
   const { error } = await supabase
     .from("subscriptions")
@@ -308,10 +303,10 @@ async function handleSubscriptionDeleted(
 
   if (error) {
     console.error("Error updating subscription to canceled:", error);
-    throw new Error(`Failed to update subscription to canceled: ${error.message}`);
+    throw new Error("Failed to update subscription to canceled");
   }
 
-  console.log(`Subscription ${subscription.id} marked as canceled`);
+  console.log(`Subscription marked as canceled`);
 }
 
 async function handleInvoicePaymentSucceeded(
@@ -323,7 +318,7 @@ async function handleInvoicePaymentSucceeded(
   const subscriptionId = invoice.subscription as string | null;
 
   console.log(
-    `Handling invoice.payment_succeeded: invoice ${invoice.id}, subscription ${subscriptionId}, customer ${customerId}`
+    `Handling invoice.payment_succeeded: invoice [redacted]`
   );
 
   const { error } = await supabase.from("invoices").upsert(
@@ -345,10 +340,10 @@ async function handleInvoicePaymentSucceeded(
 
   if (error) {
     console.error("Error upserting invoice for invoice.payment_succeeded:", error);
-    throw new Error(`Failed to upsert invoice: ${error.message}`);
+    throw new Error("Failed to upsert invoice");
   }
 
-  console.log(`Invoice ${invoice.id} upserted as paid`);
+  console.log(`Invoice upserted as paid`);
 }
 
 async function handleInvoicePaymentFailed(
@@ -360,7 +355,7 @@ async function handleInvoicePaymentFailed(
   const subscriptionId = invoice.subscription as string | null;
 
   console.error(
-    `Handling invoice.payment_failed: invoice ${invoice.id}, subscription ${subscriptionId}, customer ${customerId}`
+    `Handling invoice.payment_failed: invoice [redacted]`
   );
 
   const { error } = await supabase.from("invoices").upsert(
@@ -382,10 +377,10 @@ async function handleInvoicePaymentFailed(
 
   if (error) {
     console.error("Error upserting invoice for invoice.payment_failed:", error);
-    throw new Error(`Failed to upsert invoice: ${error.message}`);
+    throw new Error("Failed to upsert invoice");
   }
 
-  console.log(`Invoice ${invoice.id} upserted as payment_failed`);
+  console.log(`Invoice upserted as payment_failed`);
 }
 
 serve(async (req: Request): Promise<Response> => {
@@ -469,7 +464,7 @@ serve(async (req: Request): Promise<Response> => {
   const eventData = event.data as Record<string, unknown>;
   const eventObject = eventData?.object as Record<string, unknown>;
 
-  console.log(`Processing Stripe event: ${eventType} (id: ${eventId})`);
+  console.log(`Processing Stripe event: ${eventType}`);
 
   try {
     switch (eventType) {
@@ -507,9 +502,9 @@ serve(async (req: Request): Promise<Response> => {
         break;
     }
   } catch (err) {
-    console.error(`Error processing event ${eventType} (id: ${eventId}):`, err);
+    console.error(`Error processing event ${eventType}:`, err);
     return new Response(
-      JSON.stringify({ error: "Internal server error while processing event" }),
+      JSON.stringify({ error: "Internal server error" }),
       {
         status: 500,
         headers: { "Content-Type": "application/json" },
