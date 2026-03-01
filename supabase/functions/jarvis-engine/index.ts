@@ -75,6 +75,8 @@ type BottleneckKey =
 const VALID_CATEGORIES = ["sommeil", "activite", "stress", "nutrition", "respiration", "meditation"] as const;
 const VALID_DIFFICULTIES = ["facile", "moyen", "difficile"] as const;
 
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 function analyzeBottleneck(aggregates: HealthAggregate[]): BottleneckKey {
   if (!aggregates || aggregates.length === 0) return "manque_activite";
 
@@ -341,17 +343,30 @@ serve(async (req: Request) => {
     return corsResponse(JSON.stringify({ error: "Method not allowed" }), 405, requestOrigin);
   }
 
+  // Capture a single timestamp for temporal consistency
+  const NOW = new Date();
+  const now = NOW.toISOString();
+  const today = now.split("T")[0];
+
   try {
     const supabaseUrl = Deno.env.get("SUPABASE_URL");
     const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
     const openaiKey = Deno.env.get("OPENAI_API_KEY");
 
     if (!supabaseUrl || !serviceRoleKey) {
-      throw new Error("Missing required environment variable: SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
+      return corsResponse(
+        JSON.stringify({ error: "Internal server error", code: "CONFIG_ERROR" }),
+        500,
+        requestOrigin
+      );
     }
 
     if (!openaiKey) {
-      throw new Error("Missing required environment variable: OPENAI_API_KEY");
+      return corsResponse(
+        JSON.stringify({ error: "Internal server error", code: "CONFIG_ERROR" }),
+        500,
+        requestOrigin
+      );
     }
 
     const supabase = createClient(supabaseUrl, serviceRoleKey, {
@@ -391,6 +406,15 @@ serve(async (req: Request) => {
       return corsResponse(JSON.stringify({ error: "user_id is required" }), 400, requestOrigin);
     }
 
+    // Validate UUID format
+    if (!UUID_REGEX.test(user_id)) {
+      return corsResponse(
+        JSON.stringify({ error: "Invalid user_id format" }),
+        400,
+        requestOrigin
+      );
+    }
+
     // Verify the authenticated user matches the requested user_id
     if (authenticatedUser.id !== user_id) {
       return corsResponse(
@@ -406,7 +430,7 @@ serve(async (req: Request) => {
     const warnings: string[] = [];
 
     // Step 1: Fetch last 7 days of health aggregates (explicit columns)
-    const sevenDaysAgo = new Date();
+    const sevenDaysAgo = new Date(NOW);
     sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
     const sevenDaysAgoStr = sevenDaysAgo.toISOString().split("T")[0];
 
@@ -422,7 +446,7 @@ serve(async (req: Request) => {
     if (aggregatesError) {
       console.error(`[${logId}] Error fetching health aggregates:`, aggregatesError.message);
       return corsResponse(
-        JSON.stringify({ error: "Failed to fetch health data", details: aggregatesError.message }),
+        JSON.stringify({ error: "Failed to fetch health data", code: "DB_ERROR" }),
         500,
         requestOrigin
       );
@@ -454,17 +478,13 @@ serve(async (req: Request) => {
     try {
       openAIResult = await callOpenAI(healthSummary, bottleneck, jarvisState, openaiKey);
     } catch (err) {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      console.error(`[${logId}] OpenAI error: ${errMsg}`);
+      console.error(`[${logId}] OpenAI error:`, err instanceof Error ? err.message : "Unknown error");
       return corsResponse(
-        JSON.stringify({ error: "Failed to generate briefing", details: errMsg }),
+        JSON.stringify({ error: "Failed to generate briefing", code: "OPENAI_ERROR" }),
         500,
         requestOrigin
       );
     }
-
-    const today = new Date().toISOString().split("T")[0];
-    const now = new Date().toISOString();
 
     // Step 5: Store missions
     const missionsToInsert = openAIResult.missions.map((mission) => ({
@@ -489,7 +509,7 @@ serve(async (req: Request) => {
     if (missionsError) {
       console.error(`[${logId}] Error inserting missions:`, missionsError.message);
       return corsResponse(
-        JSON.stringify({ error: "Failed to store missions", details: missionsError.message }),
+        JSON.stringify({ error: "Failed to store missions", code: "DB_ERROR" }),
         500,
         requestOrigin
       );
@@ -525,7 +545,6 @@ serve(async (req: Request) => {
     // Step 7: Return response
     const responsePayload = {
       success: true,
-      user_id,
       bottleneck,
       bottleneck_label: bottleneckLabel(bottleneck),
       briefing_text: openAIResult.briefing_text,
@@ -539,10 +558,9 @@ serve(async (req: Request) => {
     console.log(`[${logId}] JARVIS engine completed successfully`);
     return corsResponse(JSON.stringify(responsePayload), 200, requestOrigin);
   } catch (err) {
-    const errMsg = err instanceof Error ? err.message : String(err);
-    console.error("Unexpected error in jarvis-engine:", errMsg);
+    console.error("Unexpected error in jarvis-engine:", err instanceof Error ? err.message : "Unknown error");
     return corsResponse(
-      JSON.stringify({ error: "Internal server error", details: errMsg }),
+      JSON.stringify({ error: "Internal server error", code: "INTERNAL_ERROR" }),
       500,
       requestOrigin
     );
