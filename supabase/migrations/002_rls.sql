@@ -79,6 +79,9 @@ CREATE POLICY "profiles: owner can update"
 
 -- Trigger qui protege les colonnes sensibles de profiles
 -- contre toute modification directe par un utilisateur.
+-- CORRECTION 2 & 4: plan et email sont des colonnes immutables
+-- pour les utilisateurs authentifies. Seul service_role peut
+-- les modifier (webhook paiement, synchronisation auth.users).
 CREATE OR REPLACE FUNCTION protect_profiles_sensitive_columns()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -110,6 +113,9 @@ CREATE TRIGGER trg_protect_profiles_sensitive_columns
 -- Users can view their own subscription record.
 -- All mutations are performed by service_role (webhooks /
 -- edge functions), so no user-facing write policies are needed.
+--
+-- CORRECTION: INSERT restreint a service_role uniquement
+-- via WITH CHECK (false) pour les utilisateurs authentifies.
 -- ============================================================
 ALTER TABLE subscriptions ENABLE ROW LEVEL SECURITY;
 
@@ -119,7 +125,15 @@ CREATE POLICY "subscriptions: owner can select"
   TO authenticated
   USING (user_id = auth.uid());
 
--- INSERT / UPDATE / DELETE intentionally omitted for regular
+-- INSERT intentionally restricted to service_role only.
+-- Authenticated users cannot insert subscription records directly.
+CREATE POLICY "subscriptions: deny insert for authenticated"
+  ON subscriptions
+  FOR INSERT
+  TO authenticated
+  WITH CHECK (false);
+
+-- UPDATE / DELETE intentionally omitted for regular
 -- users; service_role bypasses RLS automatically.
 
 
@@ -169,10 +183,10 @@ CREATE POLICY "health_access_log: owner can select"
 --
 -- PROTECTION:
 --   1. Contrainte UNIQUE sur (user_id, sample_type, recorded_at)
---      pour eviter les doublons.
+--      pour eviter les doublons (CORRECTION 6).
 --   2. Trigger BEFORE INSERT qui limite le volume journalier
 --      a 10 000 insertions par utilisateur par jour afin
---      d'eviter un DoS sur le stockage.
+--      d'eviter un DoS sur le stockage (CORRECTION 6).
 -- ============================================================
 ALTER TABLE health_samples ENABLE ROW LEVEL SECURITY;
 
@@ -263,7 +277,8 @@ CREATE POLICY "health_daily_aggregates: owner can select"
 -- PROTECTION: colonnes systeme (computed_level, total_sessions,
 -- last_computed_at, xp_total) ne peuvent etre modifiees
 -- que par service_role. Le trigger BEFORE UPDATE restaure
--- ces valeurs de facon statique si le role est 'authenticated'.
+-- ces valeurs de facon statique si le role est 'authenticated'
+-- (CORRECTION 7).
 -- ============================================================
 ALTER TABLE jarvis_states ENABLE ROW LEVEL SECURITY;
 
@@ -282,6 +297,9 @@ CREATE POLICY "jarvis_states: owner can update"
 
 -- Trigger qui protege les colonnes systeme de jarvis_states.
 -- Les colonnes protegees sont referencees statiquement.
+-- CORRECTION 7: colonnes systeme (computed_level, xp_total,
+-- total_sessions, last_computed_at) sont restaurees depuis OLD
+-- pour tout role autre que service_role.
 CREATE OR REPLACE FUNCTION protect_jarvis_states_system_columns()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -319,7 +337,12 @@ CREATE TRIGGER trg_protect_jarvis_states_system_columns
 -- PROTECTION: seules les colonnes status et completed_at
 -- peuvent etre mises a jour par l'utilisateur. Les colonnes
 -- sensibles (type, reward_xp, user_id) sont verifiees dans
--- un trigger afin qu'elles ne puissent pas etre alterees.
+-- un trigger afin qu'elles ne puissent pas etre alterees
+-- (CORRECTION 3).
+--
+-- INSERT restreint a service_role uniquement via
+-- WITH CHECK (false) pour les utilisateurs authentifies
+-- (CORRECTION pour INSERT manquant).
 -- ============================================================
 ALTER TABLE missions ENABLE ROW LEVEL SECURITY;
 
@@ -328,6 +351,14 @@ CREATE POLICY "missions: owner can select"
   FOR SELECT
   TO authenticated
   USING (user_id = auth.uid());
+
+-- INSERT intentionally restricted to service_role only.
+-- Authenticated users cannot create mission records directly.
+CREATE POLICY "missions: deny insert for authenticated"
+  ON missions
+  FOR INSERT
+  TO authenticated
+  WITH CHECK (false);
 
 -- La policy UPDATE autorise uniquement la modification
 -- des colonnes de completion (status, completed_at).
@@ -381,8 +412,20 @@ CREATE TRIGGER trg_protect_missions_sensitive_columns
 -- CHECK_INS
 -- Users submit daily/event check-ins from the mobile app
 -- and can review their own history.
+--
+-- CORRECTION 8: UPDATE / DELETE intentionnellement omis
+-- et documente explicitement. Les check-ins sont immuables.
+-- Une contrainte CHECK sur created_at empeche les timestamps
+-- futurs (tolerance d'1 minute pour le decalage horloge).
 -- ============================================================
 ALTER TABLE check_ins ENABLE ROW LEVEL SECURITY;
+
+-- Contrainte pour eviter les timestamps futurs (CORRECTION 8)
+ALTER TABLE check_ins
+  DROP CONSTRAINT IF EXISTS chk_check_ins_created_at_not_future;
+ALTER TABLE check_ins
+  ADD CONSTRAINT chk_check_ins_created_at_not_future
+  CHECK (created_at <= now() + interval '1 minute');
 
 CREATE POLICY "check_ins: owner can insert"
   ON check_ins
@@ -397,6 +440,8 @@ CREATE POLICY "check_ins: owner can select"
   USING (user_id = auth.uid());
 
 -- UPDATE / DELETE intentionally omitted: check-ins are immutable.
+-- This is an explicit design decision: check-in records form an
+-- auditable history and must not be modified or deleted by users.
 
 
 -- ============================================================
@@ -407,6 +452,10 @@ CREATE POLICY "check_ins: owner can select"
 -- requis pour acceder au module:
 --   NULL ou 'free' => accessible a tous les authentifies
 --   autres valeurs => necessite un abonnement actif correspondant
+--
+-- CORRECTION 5: filtrage explicite par plan via la colonne
+-- required_plan. Cette intention est documentee ici.
+-- Si tous les modules sont 'free', required_plan = NULL ou 'free'.
 -- ============================================================
 ALTER TABLE modules ENABLE ROW LEVEL SECURITY;
 
@@ -455,6 +504,11 @@ CREATE POLICY "box_orders: owner can select"
 -- Aucune policy UPDATE n'est accordee aux utilisateurs afin
 -- d'eviter toute manipulation d'etat (reactivation, extension
 -- d'expiration, modification du swap_type).
+--
+-- CORRECTION 1: UPDATE omis intentionnellement pour les
+-- utilisateurs authentifies. La consommation du token est
+-- geree exclusivement par service_role via une edge function
+-- securisee pour eviter toute manipulation d'etat.
 -- ============================================================
 ALTER TABLE swap_tokens ENABLE ROW LEVEL SECURITY;
 
@@ -467,6 +521,7 @@ CREATE POLICY "swap_tokens: owner can select"
 -- UPDATE intentionally omitted for authenticated users.
 -- Token consumption is handled exclusively by service_role
 -- edge functions to prevent state manipulation attacks.
+-- (reactivation, expiry extension, swap_type modification)
 
 
 -- ============================================================
@@ -474,6 +529,9 @@ CREATE POLICY "swap_tokens: owner can select"
 -- Immutable ledger of XP-earning events written by
 -- edge functions / triggers (service_role). Users can
 -- view their own XP history.
+--
+-- CORRECTION: INSERT restreint a service_role uniquement
+-- via WITH CHECK (false) pour les utilisateurs authentifies.
 -- ============================================================
 ALTER TABLE xp_events ENABLE ROW LEVEL SECURITY;
 
@@ -483,7 +541,15 @@ CREATE POLICY "xp_events: owner can select"
   TO authenticated
   USING (user_id = auth.uid());
 
--- INSERT / UPDATE / DELETE reserved for service_role only.
+-- INSERT intentionally restricted to service_role only.
+-- Authenticated users cannot insert XP events directly.
+CREATE POLICY "xp_events: deny insert for authenticated"
+  ON xp_events
+  FOR INSERT
+  TO authenticated
+  WITH CHECK (false);
+
+-- UPDATE / DELETE reserved for service_role only.
 
 
 -- ============================================================
@@ -526,8 +592,29 @@ CREATE POLICY "streaks: owner can select"
 -- service_role bypasses RLS, and authenticated/anon roles
 -- are denied access implicitly by enabling RLS with no
 -- permissive policies for those roles.
+--
+-- CORRECTION: INSERT explicitement restreint a service_role
+-- via WITH CHECK (false) pour les utilisateurs authentifies.
 -- ============================================================
 ALTER TABLE jobs ENABLE ROW LEVEL SECURITY;
 
--- No policies for authenticated or anon roles.
+-- INSERT intentionally restricted to service_role only.
+-- Authenticated users cannot enqueue jobs directly.
+CREATE POLICY "jobs: deny insert for authenticated"
+  ON jobs
+  FOR INSERT
+  TO authenticated
+  WITH CHECK (false);
+
+-- No SELECT / UPDATE / DELETE policies for authenticated or anon roles.
 -- service_role accesses this table outside of RLS.
+
+
+-- ============================================================
+-- NOTE: Aucune policy pour le role 'anon' n'est definie
+-- intentionnellement.
+-- Tous les acces requierent un JWT authentifie (role
+-- 'authenticated').
+-- Les webhooks et jobs utilisent le role 'service_role' qui
+-- bypasse RLS.
+-- ============================================================
