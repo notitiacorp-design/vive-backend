@@ -5,13 +5,9 @@ import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 // warm invocations.
 // ---------------------------------------------------------------------------
 
-const supabaseUrl = Deno.env.get('SUPABASE_URL');
-const supabaseAnonKey = Deno.env.get('SUPABASE_ANON_KEY');
-const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY');
-
-if (!supabaseUrl || !supabaseAnonKey || !supabaseServiceKey) {
-  throw new Error('Missing required Supabase environment variables (SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE_KEY)');
-}
+const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? (() => { throw new Error('Missing SUPABASE_URL'); })();
+const supabaseAnonKey = Deno.env.get('SUPABASE_ANON_KEY') ?? (() => { throw new Error('Missing SUPABASE_ANON_KEY'); })();
+const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? (() => { throw new Error('Missing SUPABASE_SERVICE_ROLE_KEY'); })();
 
 // Admin client reused across invocations (no user session).
 const adminClient = createClient(supabaseUrl, supabaseServiceKey, {
@@ -157,11 +153,11 @@ interface ValidationError {
 // ---------------------------------------------------------------------------
 
 /**
- * Sanitises metadata:
- * - Rejects if serialised size > MAX_METADATA_JSON.
- * - Keeps only whitelisted top-level keys.
- * - Accepts only primitive leaf values (string | number | boolean).
- * Returns null if metadata is empty/undefined/null.
+ * Sanitise les mÃ©tadonnÃ©es:
+ * - Rejette si la taille sÃ©rialisÃ©e dÃ©passe MAX_METADATA_JSON.
+ * - Ne conserve que les clÃ©s de premier niveau whitelistÃ©es.
+ * - N'accepte que des valeurs primitives (string | number | boolean).
+ * Retourne null si metadata est vide/undefined/null.
  */
 function sanitiseMetadata(
   raw: unknown,
@@ -201,6 +197,7 @@ function sanitiseMetadata(
 
 function validateSamples(
   samples: unknown[],
+  strictMode: boolean,
 ): { valid: HealthSample[]; errors: ValidationError[] } {
   const valid: HealthSample[] = [];
   const errors: ValidationError[] = [];
@@ -214,6 +211,7 @@ function validateSamples(
 
     if (typeof sample !== 'object' || sample === null || Array.isArray(sample)) {
       errors.push({ index: i, field: 'sample', message: 'Each sample must be a non-null object' });
+      if (strictMode) continue;
       continue;
     }
 
@@ -284,7 +282,7 @@ function validateSamples(
     }
     if (hasError) continue;
 
-    // value range.
+    // value range check per metric_type.
     const range = VALUE_RANGES[metricType];
     if (range) {
       const [min, max] = range;
@@ -381,10 +379,10 @@ function validateSamples(
 
 /**
  * Returns YYYY-MM-DD for a given ISO timestamp.
- * NOTE: All timestamps are assumed to be UTC. The client is responsible for
- * aligning timestamps to the user's local midnight before sending.
- * An optional timezone parameter can be passed in the payload for
- * server-side alignment (stored in metadata / future use).
+ * NOTE: Tous les timestamps sont supposÃ©s Ãªtre en UTC. Le client est
+ * responsable d'aligner les timestamps sur minuit local avant l'envoi.
+ * Un champ optionnel `timezone` peut Ãªtre inclus dans le payload pour
+ * un alignement cÃ´tÃ© serveur (stockÃ© en metadata / usage futur).
  */
 function toDateString(ts: string): string {
   return new Date(ts).toISOString().split('T')[0];
@@ -393,6 +391,8 @@ function toDateString(ts: string): string {
 /**
  * Wraps JSON.stringify of an error for safe client responses.
  * Returns a sanitised message + a traceable error_id.
+ * L'utilisateur reÃ§oit uniquement un message gÃ©nÃ©rique et un error_id.
+ * Le dÃ©tail complet est loggÃ© cÃ´tÃ© serveur uniquement.
  */
 function makeErrorResponse(
   publicMessage: string,
@@ -431,7 +431,7 @@ Deno.serve(async (req: Request) => {
   const origin      = req.headers.get('Origin');
   const corsHeaders = getCorsHeaders(origin);
 
-  // ââ Preflight ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+  // â Preflight ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
   if (req.method === 'OPTIONS') {
     return new Response(null, { status: 204, headers: corsHeaders });
   }
@@ -443,7 +443,7 @@ Deno.serve(async (req: Request) => {
     );
   }
 
-  // ââ Content-Type validation ââââââââââââââââââââââââââââââââââââââââââââââ
+  // â Content-Type validation ââââââââââââââââââââââââââââââââââââââââââââ
   const contentType = req.headers.get('content-type') ?? '';
   if (!contentType.includes('application/json')) {
     return new Response(
@@ -452,8 +452,20 @@ Deno.serve(async (req: Request) => {
     );
   }
 
+  // â Body size guard (Content-Length header check) ââââââââââââââââââââââ
+  const contentLengthHeader = req.headers.get('content-length');
+  if (contentLengthHeader) {
+    const contentLength = parseInt(contentLengthHeader, 10);
+    if (!isNaN(contentLength) && contentLength > MAX_BODY_BYTES) {
+      return new Response(
+        JSON.stringify({ error: `Request body too large. Maximum ${MAX_BODY_BYTES} bytes.` }),
+        { status: 413, headers: { ...corsHeaders, 'Content-Type': 'application/json' } },
+      );
+    }
+  }
+
   try {
-    // ââ Auth âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+    // â Auth ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
     const authHeader = req.headers.get('Authorization');
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
       return new Response(
@@ -465,7 +477,9 @@ Deno.serve(async (req: Request) => {
     const jwt = authHeader.slice('Bearer '.length);
 
     // User-scoped client (validates JWT, no elevated privileges).
-    const userClient = createClient(supabaseUrl!, supabaseAnonKey!, {
+    // NOTE: userId est toujours extrait du JWT (jamais du body) comme
+    // protection anti-IDOR: un utilisateur ne peut accÃ©der qu'Ã  ses propres donnÃ©es.
+    const userClient = createClient(supabaseUrl, supabaseAnonKey, {
       global: { headers: { Authorization: `Bearer ${jwt}` } },
       auth:   { persistSession: false },
     });
@@ -478,20 +492,10 @@ Deno.serve(async (req: Request) => {
       );
     }
 
+    // userId est issu exclusivement du JWT validÃ© par Supabase Auth (protection IDOR).
     const userId = user.id;
 
-    // ââ Body size guard ââââââââââââââââââââââââââââââââââââââââââââââââââ
-    const contentLengthHeader = req.headers.get('content-length');
-    if (contentLengthHeader) {
-      const contentLength = parseInt(contentLengthHeader, 10);
-      if (!isNaN(contentLength) && contentLength > MAX_BODY_BYTES) {
-        return new Response(
-          JSON.stringify({ error: `Request body too large. Maximum ${MAX_BODY_BYTES} bytes.` }),
-          { status: 413, headers: { ...corsHeaders, 'Content-Type': 'application/json' } },
-        );
-      }
-    }
-
+    // â Body read with size limit ââââââââââââââââââââââââââââââââââââââââââ
     let rawBodyText: string;
     try {
       rawBodyText = await req.text();
@@ -506,7 +510,7 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    // ââ Parse JSON âââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+    // â Parse JSON ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
     let body: unknown;
     try {
       body = JSON.parse(rawBodyText);
@@ -524,7 +528,16 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    const { samples: rawSamples } = body as { samples: unknown };
+    const bodyObj = body as { samples: unknown; strict?: unknown };
+    const { samples: rawSamples } = bodyObj;
+
+    // â Strict mode (partial insert support) âââââââââââââââââââââââââââââââ
+    // ?strict=false or body.strict=false enables partial mode: valid samples
+    // are inserted and errors are returned for invalid ones without failing
+    // the entire request.
+    const urlParams = new URL(req.url).searchParams;
+    const strictParam = urlParams.get('strict') ?? String(bodyObj.strict ?? 'true');
+    const strictMode = strictParam.toLowerCase() !== 'false';
 
     if (!Array.isArray(rawSamples)) {
       return new Response(
@@ -535,7 +548,7 @@ Deno.serve(async (req: Request) => {
 
     if (rawSamples.length === 0) {
       return new Response(
-        JSON.stringify({ synced: 0, aggregates_updated: 0 }),
+        JSON.stringify({ samples_processed: 0, aggregates_updated: 0 }),
         { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } },
       );
     }
@@ -547,10 +560,12 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    // ââ Validate âââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
-    const { valid: validSamples, errors: validationErrors } = validateSamples(rawSamples);
+    // â Validate âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+    const { valid: validSamples, errors: validationErrors } = validateSamples(rawSamples, strictMode);
 
-    if (validationErrors.length > 0) {
+    // In strict mode: any validation error fails the entire request.
+    // In partial mode: continue with valid samples, return errors alongside results.
+    if (strictMode && validationErrors.length > 0) {
       return new Response(
         JSON.stringify({
           error: 'Validation failed for one or more samples.',
@@ -560,21 +575,32 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    // ââ UPSERT health_samples via RPC ââââââââââââââââââââââââââââââââââââ
-    // NOTE: health data (value, metadata) should be encrypted at the column
-    // level using pgcrypto (pgp_sym_encrypt) or Supabase Vault. The RPC
-    // function `upsert_health_samples` is expected to handle encryption
-    // transparently. Until column-level encryption is configured in the DB,
-    // data is protected solely by cloud-provider disk encryption and Supabase
-    // Row-Level Security (RLS).
+    if (validSamples.length === 0) {
+      return new Response(
+        JSON.stringify({
+          samples_processed: 0,
+          aggregates_updated: 0,
+          validation_errors: validationErrors,
+        }),
+        { status: 422, headers: { ...corsHeaders, 'Content-Type': 'application/json' } },
+      );
+    }
+
+    // â UPSERT health_samples via RPC ââââââââââââââââââââââââââââââââââââââ
+    // NOTE: Les donnÃ©es de santÃ© (value, metadata) devraient Ãªtre chiffrÃ©es
+    // au niveau colonne avec pgcrypto (pgp_sym_encrypt) ou Supabase Vault.
+    // La fonction RPC `upsert_health_samples` est censÃ©e gÃ©rer le chiffrement
+    // de maniÃ¨re transparente. Sans chiffrement colonne configurÃ© en DB,
+    // les donnÃ©es sont protÃ©gÃ©es uniquement par le chiffrement disque du
+    // provider cloud et la Row-Level Security (RLS) de Supabase.
     //
-    // The RPC is expected to:
-    //   1. Upsert rows into health_samples.
-    //   2. Return a result set of { id, metric_type, start_ts, is_new_insert }
-    //      where is_new_insert = (xmax = 0) at the time of write.
+    // La RPC doit:
+    //   1. Upsert les lignes dans health_samples.
+    //   2. Retourner { id, metric_type, start_ts, is_new_insert }
+    //      oÃ¹ is_new_insert = (xmax = 0) au moment de l'Ã©criture.
     //
-    // Fallback: if the RPC is not yet available we perform a direct upsert
-    // and mark all rows as new (conservative: may create extra jobs).
+    // Fallback: si la RPC n'est pas disponible, on effectue un upsert direct
+    // et on marque toutes les lignes comme nouvelles (conservateur).
 
     const rows = validSamples.map((s) => ({
       user_id:     userId,
@@ -584,12 +610,14 @@ Deno.serve(async (req: Request) => {
       end_ts:      s.end_ts,
       value:       s.value,
       unit:        s.unit,
-      // NOTE: encrypt metadata via pgcrypto inside the DB function.
+      // NOTE: chiffrer metadata via pgcrypto dans la fonction DB.
       metadata:    s.metadata ?? null,
     }));
 
     // Try RPC-based upsert first (returns is_new_insert via xmax trick).
-    let syncedCount = 0;
+    let samplesProcessed = 0;
+    let insertedCount = 0;
+    let updatedCount = 0;
     let newlyInsertedMetricTypes: string[] = [];
     let newlyInsertedDates: string[] = [];
     let hasNewInserts = false;
@@ -615,14 +643,17 @@ Deno.serve(async (req: Request) => {
         return makeErrorResponse('Failed to sync health samples.', 500, corsHeaders, upsertError);
       }
 
-      syncedCount = upsertedData?.length ?? 0;
+      samplesProcessed = upsertedData?.length ?? 0;
+      insertedCount = samplesProcessed; // conservative: treat all as new inserts
+      updatedCount = 0;
       // Conservative: treat all as new inserts when RPC is unavailable.
-      hasNewInserts = syncedCount > 0;
+      hasNewInserts = samplesProcessed > 0;
       newlyInsertedMetricTypes = [...new Set(validSamples.map((s) => s.metric_type))];
       newlyInsertedDates       = [...new Set(validSamples.map((s) => toDateString(s.start_ts)))];
     } else {
       // RPC succeeded.
       // Expected shape: Array<{ id: string, metric_type: string, start_ts: string, is_new_insert: boolean }>
+      // is_new_insert is determined server-side using xmax = 0 trick in PostgreSQL.
       const upsertResult = (rpcUpsertData ?? []) as Array<{
         id:            string;
         metric_type:   string;
@@ -630,24 +661,33 @@ Deno.serve(async (req: Request) => {
         is_new_insert: boolean;
       }>;
 
-      syncedCount = upsertResult.length;
+      samplesProcessed = upsertResult.length;
 
       const newRows = upsertResult.filter((r) => r.is_new_insert);
-      hasNewInserts = newRows.length > 0;
+      const updatedRows = upsertResult.filter((r) => !r.is_new_insert);
+      insertedCount = newRows.length;
+      updatedCount = updatedRows.length;
+      hasNewInserts = insertedCount > 0;
 
+      // Use only newly inserted rows for job creation (genuine new data).
       newlyInsertedMetricTypes = [...new Set(newRows.map((r) => r.metric_type))];
       newlyInsertedDates       = [...new Set(newRows.map((r) => toDateString(r.start_ts)))];
     }
 
-    // ââ Recalculate daily aggregates via RPC âââââââââââââââââââââââââââââ
-    // Prefer a single RPC call that handles all (date, metric_type) pairs
-    // server-side to avoid N+1 DB round-trips.
+    // â Recalculate daily aggregates via RPC âââââââââââââââââââââââââââââ
+    // PrÃ©fÃ©rer un seul appel RPC qui gÃ¨re toutes les paires (date, metric_type)
+    // cÃ´tÃ© serveur pour Ã©viter les N+1 round-trips DB.
     //
-    // Expected RPC signature:
+    // Signature RPC attendue:
     //   recalculate_daily_aggregates(
     //     p_user_id uuid,
     //     p_pairs   jsonb   -- [{date, metric_type}]
-    //   ) returns int       -- number of aggregate rows upserted
+    //   ) returns int       -- nombre de lignes d'agrÃ©gats upsertÃ©es
+    //
+    // NOTE: Tous les timestamps sont en UTC. Le client est responsable de
+    // l'alignement sur le fuseau horaire local. Un champ `timezone` peut
+    // Ãªtre ajoutÃ© au payload pour un alignement cÃ´tÃ© serveur futur.
+    // Pour les mÃ©triques continues, filtrer sur end_ts peut Ãªtre pertinent.
 
     const affectedPairsMap = new Map<string, { date: string; metric_type: string }>();
     for (const s of validSamples) {
@@ -678,7 +718,7 @@ Deno.serve(async (req: Request) => {
       // RPC not available â fall back to a time-bounded batched loop (best-effort, logged).
       console.warn(
         'recalculate_daily_aggregates RPC unavailable, falling back to batched loop. ' +
-        'Please create the RPC to avoid performance issues:',
+        'Please create the RPC to avoid N+1 performance issues:',
         rpcAggError.message,
       );
 
@@ -695,6 +735,7 @@ Deno.serve(async (req: Request) => {
         const startOfDay = `${date}T00:00:00.000Z`;
         const endOfDay   = `${date}T23:59:59.999Z`;
 
+        // Explicit column list instead of SELECT *
         const { data: daySamples, error: fetchError } = await adminClient
           .from('health_samples')
           .select('value, unit')
@@ -705,7 +746,8 @@ Deno.serve(async (req: Request) => {
 
         if (fetchError) {
           const fId = crypto.randomUUID();
-          console.error(`[${fId}] Failed to fetch samples for aggregation (${date}, ${metric_type}):`, fetchError);
+          // Log error with traceable ID, no PII or internal DB details exposed to client.
+          console.error(`[${fId}] Failed to fetch samples for aggregation (${date}, ${metric_type}):`, fetchError.message);
           return 0;
         }
 
@@ -721,7 +763,7 @@ Deno.serve(async (req: Request) => {
           aggregatedValue   = values.reduce((sum: number, v: number) => sum + v, 0);
           aggregationMethod = 'sum';
         } else {
-          // continuous or unknown â average
+          // continuous or unknown â average
           aggregatedValue   = values.reduce((sum: number, v: number) => sum + v, 0) / values.length;
           aggregationMethod = 'avg';
         }
@@ -746,7 +788,8 @@ Deno.serve(async (req: Request) => {
 
         if (aggError) {
           const aId = crypto.randomUUID();
-          console.error(`[${aId}] Failed to upsert aggregate (${date}, ${metric_type}):`, aggError);
+          // Log error server-side only, no internal details exposed to client.
+          console.error(`[${aId}] Failed to upsert aggregate (${date}, ${metric_type}):`, aggError.message);
           return 0;
         }
 
@@ -782,24 +825,26 @@ Deno.serve(async (req: Request) => {
           timeoutErr,
         );
         // Non-fatal: continue with whatever count was accumulated before timeout.
-        // aggregatesUpdated remains at its last known value (0 if timeout fired before any result).
       }
     } else {
       aggregatesUpdated = typeof rpcAggData === 'number' ? rpcAggData : (rpcAggData as unknown as number | null) ?? 0;
     }
 
-    // ââ Create job for jarvis-engine (only for genuinely new data) âââââââ
+    // â Create job for jarvis-engine (only for genuinely new inserts) ââââââ
+    // Uses newlyInsertedMetricTypes/newlyInsertedDates derived from is_new_insert
+    // (xmax trick) so only truly new data triggers downstream processing.
     if (hasNewInserts && newlyInsertedMetricTypes.length > 0) {
       const jobRow = {
         user_id:  userId,
         job_type: 'health_analysis',
         status:   'pending',
         payload: {
-          trigger:            'health_sync',
-          new_samples_count:  syncedCount,
-          metric_types:       newlyInsertedMetricTypes,
-          dates:              newlyInsertedDates,
-          synced_at:          new Date().toISOString(),
+          trigger:           'health_sync',
+          inserted_count:    insertedCount,
+          updated_count:     updatedCount,
+          metric_types:      newlyInsertedMetricTypes,
+          dates:             newlyInsertedDates,
+          synced_at:         new Date().toISOString(),
         },
         created_at: new Date().toISOString(),
       };
@@ -811,16 +856,25 @@ Deno.serve(async (req: Request) => {
       if (jobError) {
         // Non-fatal: log but do not fail the request.
         const jId = crypto.randomUUID();
-        console.error(`[${jId}] Failed to create jarvis-engine job:`, jobError);
+        console.error(`[${jId}] Failed to create jarvis-engine job:`, jobError.message);
       }
     }
 
-    // ââ Success ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+    // â Success ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+    const responsePayload: Record<string, unknown> = {
+      samples_processed:  samplesProcessed,
+      inserted:           insertedCount,
+      updated:            updatedCount,
+      aggregates_updated: aggregatesUpdated,
+    };
+
+    // In partial mode, include validation errors for rejected samples.
+    if (!strictMode && validationErrors.length > 0) {
+      responsePayload.validation_errors = validationErrors;
+    }
+
     return new Response(
-      JSON.stringify({
-        synced:             syncedCount,
-        aggregates_updated: aggregatesUpdated,
-      }),
+      JSON.stringify(responsePayload),
       { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } },
     );
 
