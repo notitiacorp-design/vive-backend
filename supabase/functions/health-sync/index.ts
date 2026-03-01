@@ -10,12 +10,16 @@ const supabaseAnonKey = Deno.env.get('SUPABASE_ANON_KEY') ?? (() => { throw new 
 const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? (() => { throw new Error('Missing SUPABASE_SERVICE_ROLE_KEY'); })();
 
 // Admin client reused across invocations (no user session).
+// IMPORTANT: adminClient is intentionally module-level (shared across warm invocations) because it
+// uses the service-role key and carries no user session state. The per-request userClient (created
+// inside the handler) is intentional: it must carry the per-request JWT for auth validation and
+// must NOT be hoisted to module scope.
 const adminClient = createClient(supabaseUrl, supabaseServiceKey, {
   auth: { persistSession: false },
 });
 
 // ---------------------------------------------------------------------------
-// CORS â origin whitelist loaded from env (comma-separated list).
+// CORS â origin whitelist loaded from env (comma-separated list).
 // Falls back to an empty list (deny all) if not set.
 // ---------------------------------------------------------------------------
 
@@ -86,8 +90,10 @@ const MAX_SOURCE_LEN    = 64;
 const MAX_METRIC_LEN    = 64;
 const MAX_UNIT_LEN      = 32;
 const MAX_METADATA_JSON = 10_240; // 10 KB
+// Max length for the free-text 'note' metadata field (PII risk).
+const MAX_NOTE_LEN      = 280;
 
-// Max allowed request body size (bytes).
+// Max allowed request body size (bytes â measured as UTF-8 byte length, not char count).
 const MAX_BODY_BYTES = 5_000_000; // 5 MB
 
 // Max samples per request.
@@ -118,6 +124,44 @@ const FALLBACK_AGG_TIMEOUT_MS = 30_000; // 30 seconds
 
 // Concurrency limit for batched DB queries in the N+1 fallback loop.
 const FALLBACK_AGG_CONCURRENCY = 10;
+
+// ---------------------------------------------------------------------------
+// Rate limiting
+// ---------------------------------------------------------------------------
+
+// Simple in-memory sliding-window rate limiter (per user ID and per IP).
+// NOTE: This is process-local and does not coordinate across Edge Function
+// replicas. For strict cross-replica enforcement, use a shared store (e.g.
+// Supabase KV / Redis). This implementation provides best-effort protection
+// against single-replica hammering.
+
+interface RateLimitBucket {
+  count:      number;
+  windowStart: number;
+}
+
+const rateLimitMap = new Map<string, RateLimitBucket>();
+const RATE_LIMIT_WINDOW_MS  = 60_000; // 1 minute window
+const RATE_LIMIT_MAX_CALLS  = 30;     // max requests per window per key
+
+/**
+ * Returns true if the key is within the allowed rate, false if exceeded.
+ * Cleans up expired buckets lazily.
+ */
+function checkRateLimit(key: string): boolean {
+  const now = Date.now();
+  const bucket = rateLimitMap.get(key);
+  if (!bucket || now - bucket.windowStart >= RATE_LIMIT_WINDOW_MS) {
+    // New window
+    rateLimitMap.set(key, { count: 1, windowStart: now });
+    return true;
+  }
+  bucket.count += 1;
+  if (bucket.count > RATE_LIMIT_MAX_CALLS) {
+    return false;
+  }
+  return true;
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -157,6 +201,7 @@ interface ValidationError {
  * - Rejette si la taille sÃ©rialisÃ©e dÃ©passe MAX_METADATA_JSON.
  * - Ne conserve que les clÃ©s de premier niveau whitelistÃ©es.
  * - N'accepte que des valeurs primitives (string | number | boolean).
+ * - Applique une limite de longueur stricte sur le champ 'note' (risque PII).
  * Retourne null si metadata est vide/undefined/null.
  */
 function sanitiseMetadata(
@@ -180,8 +225,12 @@ function sanitiseMetadata(
     if (!ALLOWED_METADATA_KEYS.has(key)) continue; // silently drop unknown keys
     const v = obj[key];
     if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') {
-      if (typeof v === 'string' && v.length > 512) {
-        return { ok: false, message: `'metadata.${key}' string value exceeds 512 characters` };
+      if (typeof v === 'string') {
+        // Apply stricter limit to 'note' field due to free-text PII risk.
+        const maxLen = key === 'note' ? MAX_NOTE_LEN : 512;
+        if (v.length > maxLen) {
+          return { ok: false, message: `'metadata.${key}' string value exceeds ${maxLen} characters` };
+        }
       }
       clean[key] = v;
     }
@@ -389,6 +438,15 @@ function toDateString(ts: string): string {
 }
 
 /**
+ * Compute the UTF-8 byte length of a string.
+ * Uses TextEncoder for accuracy with multi-byte characters.
+ * Avoids the pitfall of using str.length (which counts UTF-16 code units).
+ */
+function utf8ByteLength(str: string): number {
+  return new TextEncoder().encode(str).length;
+}
+
+/**
  * Wraps JSON.stringify of an error for safe client responses.
  * Returns a sanitised message + a traceable error_id.
  * L'utilisateur reÃ§oit uniquement un message gÃ©nÃ©rique et un error_id.
@@ -431,7 +489,7 @@ Deno.serve(async (req: Request) => {
   const origin      = req.headers.get('Origin');
   const corsHeaders = getCorsHeaders(origin);
 
-  // â Preflight ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+  // â Preflight ââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
   if (req.method === 'OPTIONS') {
     return new Response(null, { status: 204, headers: corsHeaders });
   }
@@ -443,7 +501,7 @@ Deno.serve(async (req: Request) => {
     );
   }
 
-  // â Content-Type validation ââââââââââââââââââââââââââââââââââââââââââââ
+  // â Content-Type validation ââââââââââââââââââââââââââââââââââââââââââ
   const contentType = req.headers.get('content-type') ?? '';
   if (!contentType.includes('application/json')) {
     return new Response(
@@ -452,7 +510,9 @@ Deno.serve(async (req: Request) => {
     );
   }
 
-  // â Body size guard (Content-Length header check) ââââââââââââââââââââââ
+  // â Body size guard (Content-Length header check â advisory only, can be spoofed) âââ
+  // The header check is an early fast-reject optimisation only. The authoritative
+  // size check is the UTF-8 byte-length check performed after the body is read.
   const contentLengthHeader = req.headers.get('content-length');
   if (contentLengthHeader) {
     const contentLength = parseInt(contentLengthHeader, 10);
@@ -465,7 +525,7 @@ Deno.serve(async (req: Request) => {
   }
 
   try {
-    // â Auth ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+    // â Auth ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
     const authHeader = req.headers.get('Authorization');
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
       return new Response(
@@ -476,7 +536,8 @@ Deno.serve(async (req: Request) => {
 
     const jwt = authHeader.slice('Bearer '.length);
 
-    // User-scoped client (validates JWT, no elevated privileges).
+    // User-scoped client created per-request (intentional: must carry the per-request
+    // JWT for auth validation and must NOT be hoisted to module scope, unlike adminClient).
     // NOTE: userId est toujours extrait du JWT (jamais du body) comme
     // protection anti-IDOR: un utilisateur ne peut accÃ©der qu'Ã  ses propres donnÃ©es.
     const userClient = createClient(supabaseUrl, supabaseAnonKey, {
@@ -495,7 +556,23 @@ Deno.serve(async (req: Request) => {
     // userId est issu exclusivement du JWT validÃ© par Supabase Auth (protection IDOR).
     const userId = user.id;
 
-    // â Body read with size limit ââââââââââââââââââââââââââââââââââââââââââ
+    // â Per-user and per-IP rate limiting ââââââââââââââââââââââââââââââââ
+    // NOTE: This is process-local (single replica). For cross-replica enforcement,
+    // use a shared store. This provides best-effort protection per replica.
+    const clientIp = req.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ?? 'unknown';
+    const userRateLimitKey = `user:${userId}`;
+    const ipRateLimitKey   = `ip:${clientIp}`;
+
+    if (!checkRateLimit(userRateLimitKey) || !checkRateLimit(ipRateLimitKey)) {
+      return new Response(
+        JSON.stringify({ error: 'Too many requests. Please slow down.' }),
+        { status: 429, headers: { ...corsHeaders, 'Content-Type': 'application/json', 'Retry-After': '60' } },
+      );
+    }
+
+    // â Body read with authoritative UTF-8 byte-length size limit ââââââââ
+    // rawBodyText.length is a UTF-16 code-unit count and may undercount for
+    // multi-byte characters. We encode to UTF-8 bytes for an accurate check.
     let rawBodyText: string;
     try {
       rawBodyText = await req.text();
@@ -503,14 +580,15 @@ Deno.serve(async (req: Request) => {
       return makeErrorResponse('Failed to read request body.', 500, corsHeaders, e);
     }
 
-    if (rawBodyText.length > MAX_BODY_BYTES) {
+    // Authoritative byte-length check (accurate for multi-byte UTF-8 sequences).
+    if (utf8ByteLength(rawBodyText) > MAX_BODY_BYTES) {
       return new Response(
         JSON.stringify({ error: `Request body too large. Maximum ${MAX_BODY_BYTES} bytes.` }),
         { status: 413, headers: { ...corsHeaders, 'Content-Type': 'application/json' } },
       );
     }
 
-    // â Parse JSON ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+    // â Parse JSON ââââââââââââââââââââââââââââââââââââââââââââââââââââââ
     let body: unknown;
     try {
       body = JSON.parse(rawBodyText);
@@ -531,13 +609,19 @@ Deno.serve(async (req: Request) => {
     const bodyObj = body as { samples: unknown; strict?: unknown };
     const { samples: rawSamples } = bodyObj;
 
-    // â Strict mode (partial insert support) âââââââââââââââââââââââââââââââ
-    // ?strict=false or body.strict=false enables partial mode: valid samples
-    // are inserted and errors are returned for invalid ones without failing
-    // the entire request.
-    const urlParams = new URL(req.url).searchParams;
-    const strictParam = urlParams.get('strict') ?? String(bodyObj.strict ?? 'true');
-    const strictMode = strictParam.toLowerCase() !== 'false';
+    // â Strict mode (partial insert support) ââââââââââââââââââââââââââââââ
+    // Priority: URL query param takes precedence over body field.
+    // If ?strict is present in the URL, it overrides body.strict.
+    // This is documented here to avoid behavioural confusion:
+    //   - URL query param: ?strict=false  -> partial mode
+    //   - Body field: { strict: false }   -> partial mode (only if no URL param)
+    // In strict mode (default): any validation error fails the entire request.
+    // In partial mode: valid samples are inserted and errors are returned alongside.
+    const urlParams  = new URL(req.url).searchParams;
+    const urlStrict  = urlParams.get('strict');
+    // URL param takes priority; fall back to body field; default true.
+    const strictParam = urlStrict !== null ? urlStrict : String(bodyObj.strict ?? 'true');
+    const strictMode  = strictParam.toLowerCase() !== 'false';
 
     if (!Array.isArray(rawSamples)) {
       return new Response(
@@ -560,7 +644,7 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    // â Validate âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+    // â Validate ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
     const { valid: validSamples, errors: validationErrors } = validateSamples(rawSamples, strictMode);
 
     // In strict mode: any validation error fails the entire request.
@@ -586,7 +670,7 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    // â UPSERT health_samples via RPC ââââââââââââââââââââââââââââââââââââââ
+    // â UPSERT health_samples via RPC ââââââââââââââââââââââââââââââââââ
     // NOTE: Les donnÃ©es de santÃ© (value, metadata) devraient Ãªtre chiffrÃ©es
     // au niveau colonne avec pgcrypto (pgp_sym_encrypt) ou Supabase Vault.
     // La fonction RPC `upsert_health_samples` est censÃ©e gÃ©rer le chiffrement
@@ -596,11 +680,17 @@ Deno.serve(async (req: Request) => {
     //
     // La RPC doit:
     //   1. Upsert les lignes dans health_samples.
-    //   2. Retourner { id, metric_type, start_ts, is_new_insert }
+    //   2. Retourner { id, metric_type, start_ts, end_ts, is_new_insert }
     //      oÃ¹ is_new_insert = (xmax = 0) au moment de l'Ã©criture.
     //
     // Fallback: si la RPC n'est pas disponible, on effectue un upsert direct
     // et on marque toutes les lignes comme nouvelles (conservateur).
+    //
+    // INDEX NOTE: For optimal performance the fallback aggregation loop requires
+    // the following index on health_samples:
+    //   CREATE INDEX IF NOT EXISTS idx_health_samples_user_metric_start
+    //     ON health_samples (user_id, metric_type, start_ts);
+    // Ensure this index exists in your database migration.
 
     const rows = validSamples.map((s) => ({
       user_id:     userId,
@@ -622,13 +712,32 @@ Deno.serve(async (req: Request) => {
     let newlyInsertedDates: string[] = [];
     let hasNewInserts = false;
 
+    // Idempotency / deduplication key: include a request-scoped idempotency_key
+    // in the job payload derived from the sorted canonical sample fingerprints so
+    // that rapid concurrent calls with the same payload can be deduplicated by the
+    // consumer. For the upsert itself the DB unique constraint on
+    // (user_id, source, metric_type, start_ts) already provides row-level
+    // idempotency. The job table insert is guarded with an idempotency_key unique
+    // constraint (see job insert below).
+    const idempotencyKey = await (async () => {
+      const fingerprint = rows
+        .map((r) => `${r.source}|${r.metric_type}|${r.start_ts}|${r.value}`)
+        .sort()
+        .join(',');
+      const msgBuffer = new TextEncoder().encode(`${userId}:${fingerprint}`);
+      const hashBuffer = await crypto.subtle.digest('SHA-256', msgBuffer);
+      return Array.from(new Uint8Array(hashBuffer))
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join('');
+    })();
+
     const { data: rpcUpsertData, error: rpcUpsertError } = await adminClient.rpc(
       'upsert_health_samples',
       { p_rows: rows },
     );
 
     if (rpcUpsertError) {
-      // RPC not available or failed â fall back to direct upsert.
+      // RPC not available or failed â fall back to direct upsert.
       console.warn('upsert_health_samples RPC unavailable, falling back to direct upsert:', rpcUpsertError.message);
 
       const { data: upsertedData, error: upsertError } = await adminClient
@@ -637,7 +746,7 @@ Deno.serve(async (req: Request) => {
           onConflict:       'user_id,source,metric_type,start_ts',
           ignoreDuplicates: false,
         })
-        .select('id, metric_type, start_ts');
+        .select('id, metric_type, start_ts, end_ts');
 
       if (upsertError) {
         return makeErrorResponse('Failed to sync health samples.', 500, corsHeaders, upsertError);
@@ -649,17 +758,35 @@ Deno.serve(async (req: Request) => {
       // Conservative: treat all as new inserts when RPC is unavailable.
       hasNewInserts = samplesProcessed > 0;
       newlyInsertedMetricTypes = [...new Set(validSamples.map((s) => s.metric_type))];
-      newlyInsertedDates       = [...new Set(validSamples.map((s) => toDateString(s.start_ts)))];
+      // Include both start_ts and end_ts dates to ensure aggregates for samples
+      // spanning midnight are recalculated for both days.
+      newlyInsertedDates = [
+        ...new Set([
+          ...validSamples.map((s) => toDateString(s.start_ts)),
+          ...validSamples.map((s) => toDateString(s.end_ts)),
+        ]),
+      ];
     } else {
       // RPC succeeded.
-      // Expected shape: Array<{ id: string, metric_type: string, start_ts: string, is_new_insert: boolean }>
+      // Expected shape: Array<{ id: string, metric_type: string, start_ts: string, end_ts: string, is_new_insert: boolean }>
       // is_new_insert is determined server-side using xmax = 0 trick in PostgreSQL.
       const upsertResult = (rpcUpsertData ?? []) as Array<{
         id:            string;
         metric_type:   string;
         start_ts:      string;
+        end_ts:        string;
         is_new_insert: boolean;
       }>;
+
+      // Validate RPC return shape â must be an array, otherwise surface an error.
+      if (!Array.isArray(upsertResult)) {
+        return makeErrorResponse(
+          'Failed to sync health samples.',
+          500,
+          corsHeaders,
+          `upsert_health_samples RPC returned unexpected shape: ${JSON.stringify(rpcUpsertData)}`,
+        );
+      }
 
       samplesProcessed = upsertResult.length;
 
@@ -670,11 +797,17 @@ Deno.serve(async (req: Request) => {
       hasNewInserts = insertedCount > 0;
 
       // Use only newly inserted rows for job creation (genuine new data).
+      // Include both start_ts and end_ts dates for midnight-spanning samples.
       newlyInsertedMetricTypes = [...new Set(newRows.map((r) => r.metric_type))];
-      newlyInsertedDates       = [...new Set(newRows.map((r) => toDateString(r.start_ts)))];
+      newlyInsertedDates = [
+        ...new Set([
+          ...newRows.map((r) => toDateString(r.start_ts)),
+          ...newRows.map((r) => toDateString(r.end_ts)),
+        ]),
+      ];
     }
 
-    // â Recalculate daily aggregates via RPC âââââââââââââââââââââââââââââ
+    // â Recalculate daily aggregates via RPC ââââââââââââââââââââââââââ
     // PrÃ©fÃ©rer un seul appel RPC qui gÃ¨re toutes les paires (date, metric_type)
     // cÃ´tÃ© serveur pour Ã©viter les N+1 round-trips DB.
     //
@@ -688,13 +821,27 @@ Deno.serve(async (req: Request) => {
     // l'alignement sur le fuseau horaire local. Un champ `timezone` peut
     // Ãªtre ajoutÃ© au payload pour un alignement cÃ´tÃ© serveur futur.
     // Pour les mÃ©triques continues, filtrer sur end_ts peut Ãªtre pertinent.
+    //
+    // PERFORMANCE NOTE: affectedPairs is computed from newly inserted/updated
+    // samples only (not all validSamples) so that pure-update payloads with no
+    // new data do not trigger unnecessary aggregate recalculation.
+    // Both start_ts and end_ts dates are included to handle midnight-spanning samples.
 
     const affectedPairsMap = new Map<string, { date: string; metric_type: string }>();
-    for (const s of validSamples) {
-      const date = toDateString(s.start_ts);
-      const key  = `${date}::${s.metric_type}`;
-      if (!affectedPairsMap.has(key)) {
-        affectedPairsMap.set(key, { date, metric_type: s.metric_type });
+    // Use the newly-inserted rows only (avoids recalculating aggregates for
+    // unchanged rows on pure-update payloads â performance + correctness).
+    const samplesForAggregation = hasNewInserts
+      ? validSamples.filter((s) => newlyInsertedDates.includes(toDateString(s.start_ts)) ||
+                                    newlyInsertedDates.includes(toDateString(s.end_ts)))
+      : [];
+
+    for (const s of samplesForAggregation) {
+      // Include both start_ts date and end_ts date to cover midnight-spanning samples.
+      for (const date of [toDateString(s.start_ts), toDateString(s.end_ts)]) {
+        const key = `${date}::${s.metric_type}`;
+        if (!affectedPairsMap.has(key)) {
+          affectedPairsMap.set(key, { date, metric_type: s.metric_type });
+        }
       }
     }
 
@@ -709,135 +856,171 @@ Deno.serve(async (req: Request) => {
       affectedPairs.splice(MAX_AFFECTED_PAIRS);
     }
 
-    const { data: rpcAggData, error: rpcAggError } = await adminClient.rpc(
-      'recalculate_daily_aggregates',
-      { p_user_id: userId, p_pairs: affectedPairs },
-    );
-
-    if (rpcAggError) {
-      // RPC not available â fall back to a time-bounded batched loop (best-effort, logged).
-      console.warn(
-        'recalculate_daily_aggregates RPC unavailable, falling back to batched loop. ' +
-        'Please create the RPC to avoid N+1 performance issues:',
-        rpcAggError.message,
+    if (affectedPairs.length > 0) {
+      const { data: rpcAggData, error: rpcAggError } = await adminClient.rpc(
+        'recalculate_daily_aggregates',
+        { p_user_id: userId, p_pairs: affectedPairs },
       );
 
-      /**
-       * Process a single (date, metric_type) pair and return 1 if the
-       * aggregate was successfully upserted, 0 otherwise.
-       */
-      const processOnePair = async (
-        date: string,
-        metric_type: string,
-      ): Promise<number> => {
-        const isCumulative = CUMULATIVE_METRICS.has(metric_type);
+      if (rpcAggError) {
+        // RPC not available â fall back to a time-bounded batched loop (best-effort, logged).
+        console.warn(
+          'recalculate_daily_aggregates RPC unavailable, falling back to batched loop. ' +
+          'Please create the RPC to avoid N+1 performance issues:',
+          rpcAggError.message,
+        );
 
-        const startOfDay = `${date}T00:00:00.000Z`;
-        const endOfDay   = `${date}T23:59:59.999Z`;
+        /**
+         * Process a single (date, metric_type) pair and return 1 if the
+         * aggregate was successfully upserted, 0 otherwise.
+         *
+         * NOTE: This fallback issues one DB query per (date, metric_type) pair
+         * (N+1 pattern). It is only used when the RPC is unavailable. Create
+         * the recalculate_daily_aggregates RPC to eliminate this pattern.
+         * Ensure the index idx_health_samples_user_metric_start exists:
+         *   CREATE INDEX IF NOT EXISTS idx_health_samples_user_metric_start
+         *     ON health_samples (user_id, metric_type, start_ts);
+         */
+        const processOnePair = async (
+          date: string,
+          metric_type: string,
+        ): Promise<number> => {
+          const isCumulative = CUMULATIVE_METRICS.has(metric_type);
 
-        // Explicit column list instead of SELECT *
-        const { data: daySamples, error: fetchError } = await adminClient
-          .from('health_samples')
-          .select('value, unit')
-          .eq('user_id',     userId)
-          .eq('metric_type', metric_type)
-          .gte('start_ts',   startOfDay)
-          .lte('start_ts',   endOfDay);
+          const startOfDay = `${date}T00:00:00.000Z`;
+          const endOfDay   = `${date}T23:59:59.999Z`;
 
-        if (fetchError) {
-          const fId = crypto.randomUUID();
-          // Log error with traceable ID, no PII or internal DB details exposed to client.
-          console.error(`[${fId}] Failed to fetch samples for aggregation (${date}, ${metric_type}):`, fetchError.message);
-          return 0;
-        }
+          // Explicit column list instead of SELECT *
+          const { data: daySamples, error: fetchError } = await adminClient
+            .from('health_samples')
+            .select('value, unit')
+            .eq('user_id',     userId)
+            .eq('metric_type', metric_type)
+            .gte('start_ts',   startOfDay)
+            .lte('start_ts',   endOfDay);
 
-        if (!daySamples || daySamples.length === 0) return 0;
+          if (fetchError) {
+            const fId = crypto.randomUUID();
+            // Log error with traceable ID, no PII or internal DB details exposed to client.
+            console.error(`[${fId}] Failed to fetch samples for aggregation (${date}, ${metric_type}):`, fetchError.message);
+            return 0;
+          }
 
-        const values = daySamples.map((s: { value: number }) => s.value);
-        const unit   = (daySamples[0] as { unit: string }).unit;
+          if (!daySamples || daySamples.length === 0) return 0;
 
-        let aggregatedValue:   number;
-        let aggregationMethod: string;
+          const values = daySamples.map((s: { value: number }) => s.value);
+          const unit   = (daySamples[0] as { unit: string }).unit;
 
-        if (isCumulative) {
-          aggregatedValue   = values.reduce((sum: number, v: number) => sum + v, 0);
-          aggregationMethod = 'sum';
-        } else {
-          // continuous or unknown â average
-          aggregatedValue   = values.reduce((sum: number, v: number) => sum + v, 0) / values.length;
-          aggregationMethod = 'avg';
-        }
+          let aggregatedValue:   number;
+          let aggregationMethod: string;
 
-        const aggregateRow = {
-          user_id:            userId,
-          date,
-          metric_type,
-          aggregated_value:   aggregatedValue,
-          unit,
-          aggregation_method: aggregationMethod,
-          sample_count:       daySamples.length,
-          updated_at:         new Date().toISOString(),
+          if (isCumulative) {
+            aggregatedValue   = values.reduce((sum: number, v: number) => sum + v, 0);
+            aggregationMethod = 'sum';
+          } else {
+            // continuous or unknown â average
+            aggregatedValue   = values.reduce((sum: number, v: number) => sum + v, 0) / values.length;
+            aggregationMethod = 'avg';
+          }
+
+          const aggregateRow = {
+            user_id:            userId,
+            date,
+            metric_type,
+            aggregated_value:   aggregatedValue,
+            unit,
+            aggregation_method: aggregationMethod,
+            sample_count:       daySamples.length,
+            updated_at:         new Date().toISOString(),
+          };
+
+          const { error: aggError } = await adminClient
+            .from('health_daily_aggregates')
+            .upsert(aggregateRow, {
+              onConflict:       'user_id,date,metric_type',
+              ignoreDuplicates: false,
+            });
+
+          if (aggError) {
+            const aId = crypto.randomUUID();
+            // Log error server-side only, no internal details exposed to client.
+            console.error(`[${aId}] Failed to upsert aggregate (${date}, ${metric_type}):`, aggError.message);
+            return 0;
+          }
+
+          return 1;
         };
 
-        const { error: aggError } = await adminClient
-          .from('health_daily_aggregates')
-          .upsert(aggregateRow, {
-            onConflict:       'user_id,date,metric_type',
-            ignoreDuplicates: false,
-          });
+        /**
+         * Process all pairs in concurrent batches of FALLBACK_AGG_CONCURRENCY,
+         * bounded by FALLBACK_AGG_TIMEOUT_MS total wall-clock time.
+         */
+        const runBatchedAggregation = async (): Promise<number> => {
+          let total = 0;
+          for (let i = 0; i < affectedPairs.length; i += FALLBACK_AGG_CONCURRENCY) {
+            const batch = affectedPairs.slice(i, i + FALLBACK_AGG_CONCURRENCY);
+            const results = await Promise.all(
+              batch.map(({ date, metric_type }) => processOnePair(date, metric_type))
+            );
+            total += results.reduce((s, v) => s + v, 0);
+          }
+          return total;
+        };
 
-        if (aggError) {
-          const aId = crypto.randomUUID();
-          // Log error server-side only, no internal details exposed to client.
-          console.error(`[${aId}] Failed to upsert aggregate (${date}, ${metric_type}):`, aggError.message);
-          return 0;
-        }
-
-        return 1;
-      };
-
-      /**
-       * Process all pairs in concurrent batches of FALLBACK_AGG_CONCURRENCY,
-       * bounded by FALLBACK_AGG_TIMEOUT_MS total wall-clock time.
-       */
-      const runBatchedAggregation = async (): Promise<number> => {
-        let total = 0;
-        for (let i = 0; i < affectedPairs.length; i += FALLBACK_AGG_CONCURRENCY) {
-          const batch = affectedPairs.slice(i, i + FALLBACK_AGG_CONCURRENCY);
-          const results = await Promise.all(
-            batch.map(({ date, metric_type }) => processOnePair(date, metric_type))
+        try {
+          aggregatesUpdated = await withTimeout(
+            runBatchedAggregation(),
+            FALLBACK_AGG_TIMEOUT_MS,
+            'fallback aggregation loop',
           );
-          total += results.reduce((s, v) => s + v, 0);
+        } catch (timeoutErr) {
+          const tId = crypto.randomUUID();
+          console.error(
+            `[${tId}] Fallback aggregation loop timed out or failed after ${FALLBACK_AGG_TIMEOUT_MS}ms:`,
+            timeoutErr,
+          );
+          // Non-fatal: continue with whatever count was accumulated before timeout.
         }
-        return total;
-      };
-
-      try {
-        aggregatesUpdated = await withTimeout(
-          runBatchedAggregation(),
-          FALLBACK_AGG_TIMEOUT_MS,
-          'fallback aggregation loop',
-        );
-      } catch (timeoutErr) {
-        const tId = crypto.randomUUID();
-        console.error(
-          `[${tId}] Fallback aggregation loop timed out or failed after ${FALLBACK_AGG_TIMEOUT_MS}ms:`,
-          timeoutErr,
-        );
-        // Non-fatal: continue with whatever count was accumulated before timeout.
+      } else {
+        // Validate RPC return value â must be a number.
+        // If the RPC returns a different shape (e.g. array of rows), we detect and
+        // surface an error rather than silently returning 0.
+        if (typeof rpcAggData === 'number') {
+          aggregatesUpdated = rpcAggData;
+        } else if (rpcAggData === null || rpcAggData === undefined) {
+          aggregatesUpdated = 0;
+        } else if (Array.isArray(rpcAggData)) {
+          // Array return: count rows as a best-effort interpretation, and warn.
+          aggregatesUpdated = (rpcAggData as unknown[]).length;
+          console.warn(
+            'recalculate_daily_aggregates RPC returned an array instead of an integer count. ' +
+            'Update the RPC to return a scalar int. Falling back to array length as count.',
+          );
+        } else {
+          // Unexpected shape â log and default to 0.
+          const unexpId = crypto.randomUUID();
+          console.error(
+            `[${unexpId}] recalculate_daily_aggregates RPC returned unexpected type:`,
+            typeof rpcAggData,
+            JSON.stringify(rpcAggData),
+          );
+          aggregatesUpdated = 0;
+        }
       }
-    } else {
-      aggregatesUpdated = typeof rpcAggData === 'number' ? rpcAggData : (rpcAggData as unknown as number | null) ?? 0;
     }
 
     // â Create job for jarvis-engine (only for genuinely new inserts) ââââââ
     // Uses newlyInsertedMetricTypes/newlyInsertedDates derived from is_new_insert
     // (xmax trick) so only truly new data triggers downstream processing.
+    // An idempotency_key derived from the canonical sample fingerprint prevents
+    // duplicate jobs from rapid concurrent calls with the same payload.
+    // The jobs table must have a UNIQUE constraint on idempotency_key.
     if (hasNewInserts && newlyInsertedMetricTypes.length > 0) {
       const jobRow = {
-        user_id:  userId,
-        job_type: 'health_analysis',
-        status:   'pending',
+        user_id:         userId,
+        job_type:        'health_analysis',
+        status:          'pending',
+        idempotency_key: idempotencyKey,
         payload: {
           trigger:           'health_sync',
           inserted_count:    insertedCount,
@@ -851,7 +1034,10 @@ Deno.serve(async (req: Request) => {
 
       const { error: jobError } = await adminClient
         .from('jobs')
-        .insert(jobRow);
+        .upsert(jobRow, {
+          onConflict:       'idempotency_key',
+          ignoreDuplicates: true,
+        });
 
       if (jobError) {
         // Non-fatal: log but do not fail the request.
@@ -860,7 +1046,7 @@ Deno.serve(async (req: Request) => {
       }
     }
 
-    // â Success ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+    // â Success ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
     const responsePayload: Record<string, unknown> = {
       samples_processed:  samplesProcessed,
       inserted:           insertedCount,
