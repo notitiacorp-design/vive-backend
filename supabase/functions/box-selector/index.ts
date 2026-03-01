@@ -60,6 +60,13 @@ const RPC_ERROR_DUPLICATE_ORDER = 'duplicate_order'
 const RPC_ERROR_INSUFFICIENT_STOCK = 'insufficient_stock'
 
 /**
+ * Anonymise un user_id pour les logs (conserve les 8 premiers caractÃ¨res).
+ */
+function anonymizeUserId(userId: string): string {
+  return userId.substring(0, 8) + '********'
+}
+
+/**
  * Tente de parser le message d'erreur PostgreSQL comme un JSON structurÃ©.
  * La RPC doit Ã©mettre: RAISE EXCEPTION '{"code":"duplicate_order","box_order_id":"..."}' USING ERRCODE = 'P0001';
  */
@@ -153,6 +160,7 @@ serve(async (req: Request) => {
       return errorResponse('user_id is required and must be a string', 400)
     }
 
+    // Validation UUID pour user_id
     if (!UUID_REGEX.test(user_id)) {
       return errorResponse('user_id must be a valid UUID', 400)
     }
@@ -170,9 +178,16 @@ serve(async (req: Request) => {
       return errorResponse('month_year must be in format YYYY-MM (e.g. 2025-03)', 400)
     }
 
+    // Validation du mois et de l'annÃ©e
     const monthNum = parseInt(month_year.split('-')[1], 10)
     const yearNum = parseInt(month_year.split('-')[0], 10)
-    if (monthNum < 1 || monthNum > 12 || yearNum < 2020) {
+    const parsedDate = new Date(month_year + '-01')
+    if (
+      isNaN(parsedDate.getTime()) ||
+      monthNum < 1 ||
+      monthNum > 12 ||
+      yearNum < 2020
+    ) {
       return errorResponse('month_year contains an invalid month or year value', 400)
     }
 
@@ -237,7 +252,7 @@ serve(async (req: Request) => {
 
     if (freshModules.length < 2) {
       console.warn(
-        `[box-selector] Only ${freshModules.length} fresh modules available for user ${user_id}. May reuse previous modules.`
+        `[box-selector] Only ${freshModules.length} fresh modules available for user ${anonymizeUserId(user_id)}. May reuse previous modules.`
       )
     }
 
@@ -271,6 +286,9 @@ serve(async (req: Request) => {
     }
 
     // --- Step 5: Select mystery_module (different category from hero) ---
+    // La sÃ©lection du module mystÃ¨re est basÃ©e sur une propriÃ©tÃ© dÃ©terministe (hash du user_id)
+    // combinÃ©e Ã  un index dans le pool, pour la reproductibilitÃ© tout en maintenant la variÃ©tÃ©.
+    // Note: Math.random() est intentionnellement Ã©vitÃ© ici pour la reproductibilitÃ©.
     const mysteryPool = modulesPool.filter(
       (m: Record<string, unknown>) =>
         m.id !== heroModule!.id &&
@@ -279,18 +297,29 @@ serve(async (req: Request) => {
 
     let mysteryModule: Record<string, unknown> | null = null
 
+    // Fonction de sÃ©lection dÃ©terministe basÃ©e sur user_id et month_year
+    function deterministicIndex(pool: Record<string, unknown>[], seed: string): number {
+      let hash = 0
+      for (let i = 0; i < seed.length; i++) {
+        hash = (hash * 31 + seed.charCodeAt(i)) >>> 0
+      }
+      return hash % pool.length
+    }
+
+    const selectionSeed = `${user_id}-${month_year}`
+
     if (mysteryPool.length > 0) {
       const topCandidates = mysteryPool.slice(0, Math.min(5, mysteryPool.length))
-      const randomIndex = Math.floor(Math.random() * topCandidates.length)
-      mysteryModule = topCandidates[randomIndex] as Record<string, unknown>
+      const selectedIndex = deterministicIndex(topCandidates, selectionSeed)
+      mysteryModule = topCandidates[selectedIndex] as Record<string, unknown>
     } else {
       const anyOtherModules = modulesPool.filter(
         (m: Record<string, unknown>) => m.id !== heroModule!.id
       )
       if (anyOtherModules.length > 0) {
         const topCandidates = anyOtherModules.slice(0, Math.min(5, anyOtherModules.length))
-        const randomIndex = Math.floor(Math.random() * topCandidates.length)
-        mysteryModule = topCandidates[randomIndex] as Record<string, unknown>
+        const selectedIndex = deterministicIndex(topCandidates, selectionSeed)
+        mysteryModule = topCandidates[selectedIndex] as Record<string, unknown>
       }
     }
 
@@ -308,7 +337,7 @@ serve(async (req: Request) => {
       heroCategory,
       currentContext
     )
-    const mysteryJustification = buildMysteryJustification(mysteryModule)
+    const mysteryJustification = buildMysteryJustification(mysteryModule, selectionSeed)
 
     const selectionContext = {
       bottleneck: currentBottleneck,
@@ -491,7 +520,11 @@ function buildHeroJustification(
   )
 }
 
-function buildMysteryJustification(module: Record<string, unknown>): string {
+/**
+ * SÃ©lection dÃ©terministe de l'introduction du module mystÃ¨re basÃ©e sur un seed.
+ * Cela garantit la reproductibilitÃ© pour les tests et Ã©vite Math.random().
+ */
+function buildMysteryJustification(module: Record<string, unknown>, seed: string): string {
   const moduleName = module.name as string
   const moduleCategory = module.category as string
 
@@ -506,10 +539,16 @@ function buildMysteryJustification(module: Record<string, unknown>): string {
     'Votre boÃ®te mystÃ¨re vous rÃ©serve une dÃ©couverte pour',
   ]
 
-  const randomIntro = surpriseIntros[Math.floor(Math.random() * surpriseIntros.length)]
+  // SÃ©lection dÃ©terministe basÃ©e sur le seed (user_id + month_year)
+  let hash = 0
+  for (let i = 0; i < seed.length; i++) {
+    hash = (hash * 31 + seed.charCodeAt(i)) >>> 0
+  }
+  const introIndex = hash % surpriseIntros.length
+  const selectedIntro = surpriseIntros[introIndex]
 
   return (
-    `${randomIntro} ${categoryGoal} avec **${moduleName}**. ` +
+    `${selectedIntro} ${categoryGoal} avec **${moduleName}**. ` +
     `Ce module mystÃ¨re a Ã©tÃ© sÃ©lectionnÃ© pour Ã©largir votre expÃ©rience bien-Ãªtre au-delÃ  de vos habitudes et vous faire dÃ©couvrir de nouvelles approches pour optimiser votre vitalitÃ©.`
   )
 }
