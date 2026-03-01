@@ -13,6 +13,48 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   throw new Error("Missing required environment variables: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY");
 }
 
+// UUID v4 validation regex
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function isValidUUID(value: string): boolean {
+  return UUID_REGEX.test(value);
+}
+
+function log(level: "info" | "warn" | "error", message: string, data?: Record<string, unknown>): void {
+  const entry: Record<string, unknown> = {
+    timestamp: new Date().toISOString(),
+    level,
+    message,
+    ...(data ? { data } : {}),
+  };
+  if (level === "error") {
+    console.error(JSON.stringify(entry));
+  } else if (level === "warn") {
+    console.warn(JSON.stringify(entry));
+  } else {
+    console.log(JSON.stringify(entry));
+  }
+}
+
+/**
+ * Extracts price_id from subscription items safely.
+ */
+function extractPriceId(subscription: Record<string, unknown>): string | null {
+  try {
+    const items = subscription.items as Record<string, unknown> | null;
+    if (!items) return null;
+    const data = items.data as Array<Record<string, unknown>> | null;
+    if (!Array.isArray(data) || data.length === 0) return null;
+    const firstItem = data[0];
+    if (!firstItem) return null;
+    const price = firstItem.price as Record<string, unknown> | null;
+    if (!price) return null;
+    return (price.id as string) ?? null;
+  } catch {
+    return null;
+  }
+}
+
 async function verifyStripeSignature(
   payload: string,
   sigHeader: string,
@@ -36,14 +78,14 @@ async function verifyStripeSignature(
     }
 
     if (!timestamp || signatures.length === 0) {
-      console.error("Missing timestamp or signatures in Stripe-Signature header");
+      log("error", "Missing timestamp or signatures in Stripe-Signature header");
       return false;
     }
 
     const tolerance = 300; // 5 minutes
     const currentTime = Math.floor(Date.now() / 1000);
     if (Math.abs(currentTime - parseInt(timestamp, 10)) > tolerance) {
-      console.error("Stripe webhook timestamp is too old or too new");
+      log("error", "Stripe webhook timestamp is too old or too new");
       return false;
     }
 
@@ -84,12 +126,41 @@ async function verifyStripeSignature(
       }
     }
 
-    console.error("No matching Stripe signature found");
+    log("error", "No matching Stripe signature found");
     return false;
   } catch (err) {
-    console.error("Error verifying Stripe signature:", err);
+    log("error", "Error verifying Stripe signature", { err: String(err) });
     return false;
   }
+}
+
+/**
+ * Acquires an idempotency lock on the stripe event id in the processed_stripe_events table.
+ * Returns true if this process should handle the event, false if already handled.
+ */
+async function acquireEventLock(
+  supabase: ReturnType<typeof createClient>,
+  stripeEventId: string,
+  eventType: string
+): Promise<boolean> {
+  // Attempt to insert into a processed_stripe_events table.
+  // The table should have a UNIQUE constraint on stripe_event_id.
+  const { error } = await supabase.from("processed_stripe_events").insert({
+    stripe_event_id: stripeEventId,
+    event_type: eventType,
+  });
+
+  if (error) {
+    if (error.code === "23505") {
+      // Unique violation â already processed
+      log("info", "Duplicate Stripe event detected, skipping", { event_type: eventType });
+      return false;
+    }
+    // Unexpected error â rethrow
+    throw new Error(`Failed to acquire event lock: ${error.message}`);
+  }
+
+  return true;
 }
 
 async function handlePaymentIntentSucceeded(
@@ -101,7 +172,12 @@ async function handlePaymentIntentSucceeded(
   const userId = metadata.user_id;
 
   if (!userId) {
-    console.warn("payment_intent.succeeded: no user_id in metadata", paymentIntent.id);
+    log("warn", "payment_intent.succeeded: no user_id in metadata");
+    return;
+  }
+
+  if (!isValidUUID(userId)) {
+    log("warn", "payment_intent.succeeded: invalid user_id format in metadata");
     return;
   }
 
@@ -114,19 +190,16 @@ async function handlePaymentIntentSucceeded(
       currency: paymentIntent.currency,
       status: "paid",
       metadata: metadata,
-      created_at: new Date().toISOString(),
     },
     { onConflict: "payment_intent_id", ignoreDuplicates: true }
   );
 
   if (error) {
-    console.error("Error upserting box_order for payment_intent.succeeded:", error);
+    log("error", "Error upserting box_order for payment_intent.succeeded", { code: error.code });
     throw new Error("Failed to create box_order");
   }
 
-  console.log(
-    `box_order upserted successfully for payment_intent [redacted]`
-  );
+  log("info", "box_order upserted successfully for payment_intent.succeeded");
 }
 
 async function handleCheckoutSessionCompleted(
@@ -138,7 +211,12 @@ async function handleCheckoutSessionCompleted(
   const userId = metadata.user_id;
 
   if (!userId) {
-    console.warn("checkout.session.completed: no user_id in metadata", session.id);
+    log("warn", "checkout.session.completed: no user_id in metadata");
+    return;
+  }
+
+  if (!isValidUUID(userId)) {
+    log("warn", "checkout.session.completed: invalid user_id format in metadata");
     return;
   }
 
@@ -155,19 +233,16 @@ async function handleCheckoutSessionCompleted(
       currency: session.currency,
       status: "paid",
       metadata: metadata,
-      created_at: new Date().toISOString(),
     },
     { onConflict: "checkout_session_id", ignoreDuplicates: true }
   );
 
   if (error) {
-    console.error("Error upserting box_order for checkout.session.completed:", error);
+    log("error", "Error upserting box_order for checkout.session.completed", { code: error.code });
     throw new Error("Failed to create box_order");
   }
 
-  console.log(
-    `box_order upserted successfully for checkout session [redacted]`
-  );
+  log("info", "box_order upserted successfully for checkout.session.completed");
 }
 
 async function handlePaymentIntentPaymentFailed(
@@ -179,10 +254,9 @@ async function handlePaymentIntentPaymentFailed(
   const userId = metadata.user_id ?? null;
   const lastPaymentError = paymentIntent.last_payment_error as Record<string, unknown> | null;
 
-  console.error("payment_intent.payment_failed:", {
-    id: paymentIntent.id,
-    error_code: lastPaymentError?.code,
-    error_type: lastPaymentError?.type,
+  log("error", "payment_intent.payment_failed", {
+    error_code: lastPaymentError?.code as string | undefined,
+    error_type: lastPaymentError?.type as string | undefined,
   });
 
   const { data: existing, error: selectError } = await supabase
@@ -192,7 +266,7 @@ async function handlePaymentIntentPaymentFailed(
     .maybeSingle();
 
   if (selectError) {
-    console.error("Error querying box_order for payment_intent.payment_failed:", selectError);
+    log("error", "Error querying box_order for payment_intent.payment_failed", { code: selectError.code });
     throw new Error("Failed to query box_order");
   }
 
@@ -203,24 +277,23 @@ async function handlePaymentIntentPaymentFailed(
         status: "payment_failed",
         failure_reason: lastPaymentError?.message ?? "Payment failed",
         stripe_event_id: stripeEventId,
-        updated_at: new Date().toISOString(),
       })
       .eq("id", existing.id);
 
     if (error) {
-      console.error("Error updating box_order status to payment_failed:", error);
+      log("error", "Error updating box_order status to payment_failed", { code: error.code });
       throw new Error("Failed to update box_order");
     } else {
-      console.log(`box_order updated to payment_failed`);
+      log("info", "box_order updated to payment_failed");
     }
   } else {
     // Aucune commande prÃ©existante : crÃ©er un enregistrement pour conserver la trace
-    console.warn(
-      `No existing box_order found for failed payment_intent; creating failure record`
-    );
+    log("warn", "No existing box_order found for failed payment_intent; creating failure record");
+
+    const validatedUserId = userId && isValidUUID(userId) ? userId : null;
 
     const { error } = await supabase.from("box_orders").insert({
-      user_id: userId,
+      user_id: validatedUserId,
       payment_intent_id: paymentIntent.id,
       stripe_event_id: stripeEventId,
       status: "payment_failed",
@@ -228,16 +301,13 @@ async function handlePaymentIntentPaymentFailed(
       amount: paymentIntent.amount,
       currency: paymentIntent.currency,
       metadata: metadata,
-      created_at: new Date().toISOString(),
     });
 
     if (error) {
-      console.error("Error inserting failure record for payment_intent.payment_failed:", error);
+      log("error", "Error inserting failure record for payment_intent.payment_failed", { code: error.code });
       throw new Error("Failed to insert failure record");
     } else {
-      console.log(
-        `Failure record created for payment_intent [redacted]`
-      );
+      log("info", "Failure record created for payment_intent.payment_failed");
     }
   }
 }
@@ -251,37 +321,36 @@ async function handleSubscriptionUpsert(
   const userId = metadata.user_id ?? null;
   const customerId = subscription.customer as string | null;
 
-  console.log(`Handling subscription upsert: [redacted]`);
+  log("info", "Handling subscription upsert");
+
+  const validatedUserId = userId && isValidUUID(userId) ? userId : null;
+  if (userId && !validatedUserId) {
+    log("warn", "subscription upsert: invalid user_id format in metadata, storing as null");
+  }
 
   const { error } = await supabase.from("subscriptions").upsert(
     {
       stripe_subscription_id: subscription.id,
       stripe_customer_id: customerId,
       stripe_event_id: stripeEventId,
-      user_id: userId,
+      user_id: validatedUserId,
       status: subscription.status,
-      price_id: (subscription.items as Record<string, unknown> | null)
-        ? ((subscription.items as Record<string, unknown>).data as Array<Record<string, unknown>>)?.[0]
-            ?.price
-            ? (((subscription.items as Record<string, unknown>).data as Array<Record<string, unknown>>)[0].price as Record<string, unknown>).id
-            : null
-        : null,
+      price_id: extractPriceId(subscription),
       current_period_start: subscription.current_period_start,
       current_period_end: subscription.current_period_end,
       cancel_at_period_end: subscription.cancel_at_period_end,
       canceled_at: subscription.canceled_at ?? null,
       metadata: metadata,
-      updated_at: new Date().toISOString(),
     },
     { onConflict: "stripe_subscription_id", ignoreDuplicates: false }
   );
 
   if (error) {
-    console.error("Error upserting subscription:", error);
+    log("error", "Error upserting subscription", { code: error.code });
     throw new Error("Failed to upsert subscription");
   }
 
-  console.log(`Subscription upserted successfully`);
+  log("info", "Subscription upserted successfully");
 }
 
 async function handleSubscriptionDeleted(
@@ -289,24 +358,40 @@ async function handleSubscriptionDeleted(
   subscription: Record<string, unknown>,
   stripeEventId: string
 ): Promise<void> {
-  console.log(`Handling subscription deleted: [redacted]`);
+  log("info", "Handling subscription deleted");
+
+  // Verify that a matching subscription exists before updating
+  const { data: existing, error: selectError } = await supabase
+    .from("subscriptions")
+    .select("id")
+    .eq("stripe_subscription_id", subscription.id)
+    .maybeSingle();
+
+  if (selectError) {
+    log("error", "Error querying subscription for deletion", { code: selectError.code });
+    throw new Error("Failed to query subscription");
+  }
+
+  if (!existing) {
+    log("warn", "handleSubscriptionDeleted: no matching subscription found, skipping update");
+    return;
+  }
 
   const { error } = await supabase
     .from("subscriptions")
     .update({
       status: "canceled",
       stripe_event_id: stripeEventId,
-      canceled_at: subscription.canceled_at ?? new Date().toISOString(),
-      updated_at: new Date().toISOString(),
+      canceled_at: subscription.canceled_at ?? null,
     })
-    .eq("stripe_subscription_id", subscription.id);
+    .eq("id", existing.id);
 
   if (error) {
-    console.error("Error updating subscription to canceled:", error);
+    log("error", "Error updating subscription to canceled", { code: error.code });
     throw new Error("Failed to update subscription to canceled");
   }
 
-  console.log(`Subscription marked as canceled`);
+  log("info", "Subscription marked as canceled");
 }
 
 async function handleInvoicePaymentSucceeded(
@@ -317,9 +402,7 @@ async function handleInvoicePaymentSucceeded(
   const customerId = invoice.customer as string | null;
   const subscriptionId = invoice.subscription as string | null;
 
-  console.log(
-    `Handling invoice.payment_succeeded: invoice [redacted]`
-  );
+  log("info", "Handling invoice.payment_succeeded");
 
   const { error } = await supabase.from("invoices").upsert(
     {
@@ -332,18 +415,16 @@ async function handleInvoicePaymentSucceeded(
       currency: invoice.currency,
       period_start: invoice.period_start,
       period_end: invoice.period_end,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
     },
     { onConflict: "stripe_invoice_id", ignoreDuplicates: false }
   );
 
   if (error) {
-    console.error("Error upserting invoice for invoice.payment_succeeded:", error);
+    log("error", "Error upserting invoice for invoice.payment_succeeded", { code: error.code });
     throw new Error("Failed to upsert invoice");
   }
 
-  console.log(`Invoice upserted as paid`);
+  log("info", "Invoice upserted as paid");
 }
 
 async function handleInvoicePaymentFailed(
@@ -354,9 +435,7 @@ async function handleInvoicePaymentFailed(
   const customerId = invoice.customer as string | null;
   const subscriptionId = invoice.subscription as string | null;
 
-  console.error(
-    `Handling invoice.payment_failed: invoice [redacted]`
-  );
+  log("error", "Handling invoice.payment_failed");
 
   const { error } = await supabase.from("invoices").upsert(
     {
@@ -369,18 +448,16 @@ async function handleInvoicePaymentFailed(
       currency: invoice.currency,
       period_start: invoice.period_start,
       period_end: invoice.period_end,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
     },
     { onConflict: "stripe_invoice_id", ignoreDuplicates: false }
   );
 
   if (error) {
-    console.error("Error upserting invoice for invoice.payment_failed:", error);
+    log("error", "Error upserting invoice for invoice.payment_failed", { code: error.code });
     throw new Error("Failed to upsert invoice");
   }
 
-  console.log(`Invoice upserted as payment_failed`);
+  log("info", "Invoice upserted as payment_failed");
 }
 
 serve(async (req: Request): Promise<Response> => {
@@ -392,10 +469,12 @@ serve(async (req: Request): Promise<Response> => {
   }
 
   // Limite de taille du body entrant (protection DoS)
+  // Note: Content-Length check is informational only; chunked transfers may omit it.
+  // The authoritative size check is performed after reading the full body.
   const MAX_BODY_SIZE = 1_048_576; // 1 MB
   const contentLength = req.headers.get("content-length");
   if (contentLength && parseInt(contentLength, 10) > MAX_BODY_SIZE) {
-    console.error(`Payload too large: ${contentLength} bytes`);
+    log("error", "Payload too large (Content-Length header)", { bytes: parseInt(contentLength, 10) });
     return new Response(JSON.stringify({ error: "Payload too large" }), {
       status: 413,
       headers: { "Content-Type": "application/json" },
@@ -404,27 +483,49 @@ serve(async (req: Request): Promise<Response> => {
 
   let rawBody: string;
   try {
-    rawBody = await req.text();
+    // Read with a size cap to handle chunked transfer encoding (no Content-Length)
+    const reader = req.body?.getReader();
+    if (!reader) {
+      return new Response(JSON.stringify({ error: "Failed to read request body" }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    const chunks: Uint8Array[] = [];
+    let totalBytes = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) {
+        totalBytes += value.byteLength;
+        if (totalBytes > MAX_BODY_SIZE) {
+          log("error", "Payload too large during streaming read", { bytes: totalBytes });
+          return new Response(JSON.stringify({ error: "Payload too large" }), {
+            status: 413,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        chunks.push(value);
+      }
+    }
+    const combined = new Uint8Array(totalBytes);
+    let offset = 0;
+    for (const chunk of chunks) {
+      combined.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    rawBody = new TextDecoder().decode(combined);
   } catch (err) {
-    console.error("Failed to read request body:", err);
+    log("error", "Failed to read request body", { err: String(err) });
     return new Response(JSON.stringify({ error: "Failed to read request body" }), {
       status: 400,
       headers: { "Content-Type": "application/json" },
     });
   }
 
-  // VÃ©rification de taille aprÃ¨s lecture rÃ©elle (dÃ©fense en profondeur)
-  if (rawBody.length > MAX_BODY_SIZE) {
-    console.error(`Payload too large after read: ${rawBody.length} bytes`);
-    return new Response(JSON.stringify({ error: "Payload too large" }), {
-      status: 413,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
-
   const stripeSignature = req.headers.get("stripe-signature");
   if (!stripeSignature) {
-    console.error("Missing Stripe-Signature header");
+    log("error", "Missing Stripe-Signature header");
     return new Response(JSON.stringify({ error: "Missing Stripe-Signature header" }), {
       status: 400,
       headers: { "Content-Type": "application/json" },
@@ -434,7 +535,7 @@ serve(async (req: Request): Promise<Response> => {
   // STRIPE_WEBHOOK_SECRET est garanti non-null grÃ¢ce Ã  la validation au dÃ©marrage
   const isValid = await verifyStripeSignature(rawBody, stripeSignature, STRIPE_WEBHOOK_SECRET!);
   if (!isValid) {
-    console.error("Stripe webhook signature verification failed");
+    log("error", "Stripe webhook signature verification failed");
     return new Response(JSON.stringify({ error: "Invalid signature" }), {
       status: 400,
       headers: { "Content-Type": "application/json" },
@@ -445,7 +546,7 @@ serve(async (req: Request): Promise<Response> => {
   try {
     event = JSON.parse(rawBody) as Record<string, unknown>;
   } catch (err) {
-    console.error("Failed to parse webhook payload as JSON:", err);
+    log("error", "Failed to parse webhook payload as JSON", { err: String(err) });
     return new Response(JSON.stringify({ error: "Invalid JSON payload" }), {
       status: 400,
       headers: { "Content-Type": "application/json" },
@@ -461,10 +562,48 @@ serve(async (req: Request): Promise<Response> => {
 
   const eventType = event.type as string;
   const eventId = event.id as string;
-  const eventData = event.data as Record<string, unknown>;
-  const eventObject = eventData?.object as Record<string, unknown>;
 
-  console.log(`Processing Stripe event: ${eventType}`);
+  // Validate that eventData and eventObject are present before processing
+  const eventData = event.data as Record<string, unknown> | null | undefined;
+  if (!eventData || typeof eventData !== "object") {
+    log("error", "Malformed event: missing or invalid data field", { event_type: eventType });
+    return new Response(JSON.stringify({ error: "Malformed event payload" }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  const eventObject = eventData.object as Record<string, unknown> | null | undefined;
+  if (!eventObject || typeof eventObject !== "object") {
+    log("error", "Malformed event: missing or invalid data.object field", { event_type: eventType });
+    return new Response(JSON.stringify({ error: "Malformed event payload" }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  log("info", "Processing Stripe event", { event_type: eventType });
+
+  // Event-level idempotency: acquire a lock before processing
+  // This prevents duplicate processing even under concurrent deliveries.
+  let acquired: boolean;
+  try {
+    acquired = await acquireEventLock(supabase, eventId, eventType);
+  } catch (err) {
+    log("error", "Failed to acquire event lock", { err: String(err), event_type: eventType });
+    return new Response(JSON.stringify({ error: "Internal server error" }), {
+      status: 500,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  if (!acquired) {
+    // Already processed â return 200 to prevent Stripe from retrying
+    return new Response(JSON.stringify({ received: true, duplicate: true }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
 
   try {
     switch (eventType) {
@@ -498,11 +637,15 @@ serve(async (req: Request): Promise<Response> => {
         break;
 
       default:
-        console.log(`Unhandled event type: ${eventType}`);
+        // Log unknown event types for observability/alerting
+        log("warn", "Unhandled Stripe event type â consider adding a handler or monitoring sink", {
+          event_type: eventType,
+          event_id: eventId,
+        });
         break;
     }
   } catch (err) {
-    console.error(`Error processing event ${eventType}:`, err);
+    log("error", "Error processing Stripe event", { event_type: eventType, err: String(err) });
     return new Response(
       JSON.stringify({ error: "Internal server error" }),
       {
