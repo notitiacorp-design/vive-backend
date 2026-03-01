@@ -1,17 +1,27 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.3";
 import { timingSafeEqual } from "https://deno.land/std@0.168.0/crypto/timing_safe_equal.ts";
 
 // ---------------------------------------------------------------------------
-// Environment variables â fail fast at boot if any are missing
+// Environment variables - fail fast at boot if any are missing
 // ---------------------------------------------------------------------------
 const REVENUECAT_WEBHOOK_SECRET = Deno.env.get("REVENUECAT_WEBHOOK_SECRET");
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
 
-if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !REVENUECAT_WEBHOOK_SECRET) {
+if (!SUPABASE_URL || typeof SUPABASE_URL !== "string" || SUPABASE_URL.trim() === "") {
   throw new Error(
-    "Missing required environment variables: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, REVENUECAT_WEBHOOK_SECRET"
+    "Missing or empty required environment variable: SUPABASE_URL"
+  );
+}
+if (!SUPABASE_SERVICE_ROLE_KEY || typeof SUPABASE_SERVICE_ROLE_KEY !== "string" || SUPABASE_SERVICE_ROLE_KEY.trim() === "") {
+  throw new Error(
+    "Missing or empty required environment variable: SUPABASE_SERVICE_ROLE_KEY"
+  );
+}
+if (!REVENUECAT_WEBHOOK_SECRET || typeof REVENUECAT_WEBHOOK_SECRET !== "string" || REVENUECAT_WEBHOOK_SECRET.trim() === "") {
+  throw new Error(
+    "Missing or empty required environment variable: REVENUECAT_WEBHOOK_SECRET"
   );
 }
 
@@ -135,7 +145,7 @@ async function handleInitialPurchase(event: Record<string, unknown>): Promise<vo
     msToIso(event.purchased_at_ms as number) ?? new Date().toISOString();
 
   console.log(
-    `[INITIAL_PURCHASE] user=${appUserId} product=${productId} plan=${plan}`
+    `[INITIAL_PURCHASE] product=${productId} plan=${plan}`
   );
 
   const { error: subError } = await withTimeout(
@@ -178,7 +188,7 @@ async function handleInitialPurchase(event: Record<string, unknown>): Promise<vo
     throw profileError;
   }
 
-  console.log(`[INITIAL_PURCHASE] success user=${appUserId}`);
+  console.log(`[INITIAL_PURCHASE] success`);
 }
 
 async function handleRenewal(event: Record<string, unknown>): Promise<void> {
@@ -189,7 +199,7 @@ async function handleRenewal(event: Record<string, unknown>): Promise<void> {
     msToIso(event.purchased_at_ms as number) ?? new Date().toISOString();
   const plan = mapProductIdToPlan(productId);
 
-  console.log(`[RENEWAL] user=${appUserId} product=${productId}`);
+  console.log(`[RENEWAL] product=${productId}`);
 
   const subscriptionPayload = {
     user_id: appUserId,
@@ -219,7 +229,7 @@ async function handleRenewal(event: Record<string, unknown>): Promise<void> {
 
   if (!updatedRows || updatedRows.length === 0) {
     console.warn(
-      `[RENEWAL] No subscription found for user=${appUserId}, falling back to upsert`
+      `[RENEWAL] No subscription found for user=[REDACTED], falling back to upsert`
     );
     const { error: upsertError } = await withTimeout(
       supabase
@@ -249,7 +259,7 @@ async function handleRenewal(event: Record<string, unknown>): Promise<void> {
     throw profileError;
   }
 
-  console.log(`[RENEWAL] success user=${appUserId}`);
+  console.log(`[RENEWAL] success`);
 }
 
 async function handleCancellation(
@@ -258,7 +268,7 @@ async function handleCancellation(
   const appUserId = event.app_user_id as string;
   const expirationAtMs = event.expiration_at_ms as number | null;
 
-  console.log(`[CANCELLATION] user=${appUserId}`);
+  console.log(`[CANCELLATION] processing`);
 
   const { error } = await withTimeout(
     supabase
@@ -277,7 +287,7 @@ async function handleCancellation(
     throw error;
   }
 
-  console.log(`[CANCELLATION] success user=${appUserId}`);
+  console.log(`[CANCELLATION] success`);
 }
 
 async function handleUncancellation(
@@ -288,7 +298,7 @@ async function handleUncancellation(
   const expirationAtMs = event.expiration_at_ms as number | null;
   const plan = mapProductIdToPlan(productId);
 
-  console.log(`[UNCANCELLATION] user=${appUserId}`);
+  console.log(`[UNCANCELLATION] processing`);
 
   const { error: subError } = await withTimeout(
     supabase
@@ -324,13 +334,13 @@ async function handleUncancellation(
     throw profileError;
   }
 
-  console.log(`[UNCANCELLATION] success user=${appUserId}`);
+  console.log(`[UNCANCELLATION] success`);
 }
 
 async function handleExpiration(event: Record<string, unknown>): Promise<void> {
   const appUserId = event.app_user_id as string;
 
-  console.log(`[EXPIRATION] user=${appUserId}`);
+  console.log(`[EXPIRATION] processing`);
 
   const { error: subError } = await withTimeout(
     supabase
@@ -364,7 +374,7 @@ async function handleExpiration(event: Record<string, unknown>): Promise<void> {
     throw profileError;
   }
 
-  console.log(`[EXPIRATION] success user=${appUserId}`);
+  console.log(`[EXPIRATION] success`);
 }
 
 async function handleBillingIssue(
@@ -373,7 +383,7 @@ async function handleBillingIssue(
   const appUserId = event.app_user_id as string;
   const expirationAtMs = event.expiration_at_ms as number | null;
 
-  console.log(`[BILLING_ISSUE] user=${appUserId}`);
+  console.log(`[BILLING_ISSUE] processing`);
 
   const { error } = await withTimeout(
     supabase
@@ -392,7 +402,7 @@ async function handleBillingIssue(
     throw error;
   }
 
-  console.log(`[BILLING_ISSUE] success user=${appUserId}`);
+  console.log(`[BILLING_ISSUE] success`);
 }
 
 async function handleProductChange(
@@ -409,7 +419,7 @@ async function handleProductChange(
   const plan = mapProductIdToPlan(newProductId);
 
   console.log(
-    `[PRODUCT_CHANGE] user=${appUserId} new_product=${newProductId} plan=${plan}`
+    `[PRODUCT_CHANGE] new_product=${newProductId} plan=${plan}`
   );
 
   const subscriptionPayload = {
@@ -439,7 +449,7 @@ async function handleProductChange(
 
   if (!updatedRows || updatedRows.length === 0) {
     console.warn(
-      `[PRODUCT_CHANGE] No subscription found for user=${appUserId}, falling back to upsert`
+      `[PRODUCT_CHANGE] No subscription found for user=[REDACTED], falling back to upsert`
     );
     const { error: upsertError } = await withTimeout(
       supabase
@@ -472,7 +482,7 @@ async function handleProductChange(
     throw profileError;
   }
 
-  console.log(`[PRODUCT_CHANGE] success user=${appUserId}`);
+  console.log(`[PRODUCT_CHANGE] success`);
 }
 
 async function handleTransfer(event: Record<string, unknown>): Promise<void> {
@@ -489,14 +499,14 @@ async function handleTransfer(event: Record<string, unknown>): Promise<void> {
     msToIso(event.purchased_at_ms as number | undefined) ?? new Date().toISOString();
 
   console.log(
-    `[TRANSFER] from=${JSON.stringify(transferredFrom)} to=${JSON.stringify(transferredTo)}`
+    `[TRANSFER] processing transfer event`
   );
 
   // Mark source users' subscriptions as transferred and reset their plan to free.
   if (transferredFrom && transferredFrom.length > 0) {
     for (const fromUserId of transferredFrom) {
       if (!UUID_REGEX.test(fromUserId)) {
-        console.warn(`[TRANSFER] Skipping invalid from user_id: ${fromUserId}`);
+        console.warn(`[TRANSFER] Skipping invalid from user_id: [REDACTED]`);
         continue;
       }
       const { error } = await withTimeout(
@@ -511,7 +521,7 @@ async function handleTransfer(event: Record<string, unknown>): Promise<void> {
       );
       if (error) {
         console.error(
-          `[TRANSFER] subscription update error for from_user=${fromUserId}:`,
+          `[TRANSFER] subscription update error for from_user=[REDACTED]:`,
           error
         );
         throw error;
@@ -526,7 +536,7 @@ async function handleTransfer(event: Record<string, unknown>): Promise<void> {
       );
       if (profileError) {
         console.error(
-          `[TRANSFER] profile update error for from_user=${fromUserId}:`,
+          `[TRANSFER] profile update error for from_user=[REDACTED]:`,
           profileError
         );
         throw profileError;
@@ -538,7 +548,7 @@ async function handleTransfer(event: Record<string, unknown>): Promise<void> {
   if (transferredTo && transferredTo.length > 0) {
     for (const toUserId of transferredTo) {
       if (!UUID_REGEX.test(toUserId)) {
-        console.warn(`[TRANSFER] Skipping invalid to user_id: ${toUserId}`);
+        console.warn(`[TRANSFER] Skipping invalid to user_id: [REDACTED]`);
         continue;
       }
 
@@ -563,7 +573,7 @@ async function handleTransfer(event: Record<string, unknown>): Promise<void> {
       );
       if (subError) {
         console.error(
-          `[TRANSFER] subscription upsert error for to_user=${toUserId}:`,
+          `[TRANSFER] subscription upsert error for to_user=[REDACTED]:`,
           subError
         );
         throw subError;
@@ -578,13 +588,13 @@ async function handleTransfer(event: Record<string, unknown>): Promise<void> {
       );
       if (profileError) {
         console.error(
-          `[TRANSFER] profile update error for to_user=${toUserId} (subscription already upserted, retry will re-apply both):`,
+          `[TRANSFER] profile update error for to_user=[REDACTED] (subscription already upserted, retry will re-apply both):`,
           profileError
         );
         throw profileError;
       }
 
-      console.log(`[TRANSFER] subscription assigned to user=${toUserId} plan=${plan}`);
+      console.log(`[TRANSFER] subscription assigned plan=${plan}`);
     }
   }
 
@@ -689,7 +699,7 @@ serve(async (req: Request) => {
 
   // Validate UUID format for app_user_id (TRANSFER events handle their own arrays separately).
   if (eventType !== "TRANSFER" && !UUID_REGEX.test(appUserId)) {
-    console.error(`[PARSE] Invalid app_user_id format: ${appUserId}`);
+    console.error(`[PARSE] Invalid app_user_id format: [REDACTED]`);
     return new Response(
       JSON.stringify({ error: "Invalid app_user_id format" }),
       { status: 400, headers: { "Content-Type": "application/json" } }
@@ -697,7 +707,7 @@ serve(async (req: Request) => {
   }
 
   console.log(
-    `[WEBHOOK] Received event type=${eventType} user=${appUserId}`
+    `[WEBHOOK] Received event type=${eventType}`
   );
 
   try {
@@ -739,7 +749,7 @@ serve(async (req: Request) => {
     }
   } catch (err) {
     console.error(
-      `[WEBHOOK] Error processing event type=${eventType} user=${appUserId}:`,
+      `[WEBHOOK] Error processing event type=${eventType}:`,
       err
     );
     return new Response(
@@ -750,8 +760,9 @@ serve(async (req: Request) => {
     );
   }
 
+  // Return minimal response - do not expose internal event details
   return new Response(
-    JSON.stringify({ received: true, type: eventType }),
+    JSON.stringify({ received: true }),
     { status: 200, headers: { "Content-Type": "application/json" } }
   );
 });
