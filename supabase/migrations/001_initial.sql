@@ -135,7 +135,7 @@ CREATE TABLE public.consent_records (
   version       text        NOT NULL,
   granted       boolean     NOT NULL,
   granted_at    timestamptz NOT NULL DEFAULT now(),
-  ip_hash       text,
+  ip_hash       text        CHECK (ip_hash IS NULL OR ip_hash ~ '^[a-f0-9]{64}$'),
   updated_at    timestamptz NOT NULL DEFAULT now(),
   CONSTRAINT consent_records_pkey PRIMARY KEY (id),
   CONSTRAINT consent_records_type_check CHECK (
@@ -207,6 +207,10 @@ CREATE INDEX idx_health_samples_start_ts     ON public.health_samples (start_ts)
 CREATE INDEX idx_health_samples_source       ON public.health_samples (source);
 CREATE INDEX idx_health_samples_created_at   ON public.health_samples (created_at);
 CREATE INDEX idx_health_samples_user_metric  ON public.health_samples (user_id, metric_type, start_ts DESC);
+-- Partial index for recent data queries (dashboard, charts)
+CREATE INDEX idx_health_samples_recent
+  ON public.health_samples (user_id, metric_type, start_ts DESC)
+  WHERE start_ts >= now() - INTERVAL '90 days';
 
 CREATE TRIGGER trg_health_samples_updated_at
   BEFORE UPDATE ON public.health_samples
@@ -235,8 +239,9 @@ CREATE INDEX idx_health_daily_date        ON public.health_daily_aggregates (dat
 CREATE INDEX idx_health_daily_metric_type ON public.health_daily_aggregates (metric_type);
 CREATE INDEX idx_health_daily_user_date   ON public.health_daily_aggregates (user_id, date DESC);
 
+-- Trigger covers both INSERT and UPDATE to keep updated_at accurate
 CREATE TRIGGER trg_health_daily_aggregates_updated_at
-  BEFORE UPDATE ON public.health_daily_aggregates
+  BEFORE INSERT OR UPDATE ON public.health_daily_aggregates
   FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at();
 
 -- ---------------------------------------------------------------------------
@@ -337,13 +342,19 @@ CREATE TABLE public.modules (
   objective   text,
   stock       int     NOT NULL DEFAULT 0 CHECK (stock >= 0),
   active      boolean NOT NULL DEFAULT true,
-  CONSTRAINT modules_pkey PRIMARY KEY (id)
+  updated_at  timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT modules_pkey PRIMARY KEY (id),
+  CONSTRAINT modules_name_unique UNIQUE (name)
 );
 
 COMMENT ON TABLE public.modules IS 'Physical product modules available for VIVE boxes';
 
 CREATE INDEX idx_modules_category ON public.modules (category);
 CREATE INDEX idx_modules_active   ON public.modules (active);
+
+CREATE TRIGGER trg_modules_updated_at
+  BEFORE UPDATE ON public.modules
+  FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at();
 
 -- ---------------------------------------------------------------------------
 -- box_orders
@@ -587,10 +598,10 @@ BEGIN
   IF v_last_checkin IS NULL THEN
     -- First ever check-in
     v_new_streak := 1;
-  ELSIF NEW.date = v_last_checkin + INTERVAL '1 day' THEN
-    -- Consecutive day
+  ELSIF NEW.date = v_last_checkin + 1 THEN
+    -- Consecutive day (integer addition on date type)
     v_new_streak := v_current_streak + 1;
-  ELSIF NEW.date = v_last_checkin + INTERVAL '2 days' AND NOT v_freeze_used THEN
+  ELSIF NEW.date = v_last_checkin + 2 AND NOT v_freeze_used THEN
     -- Missed one day but freeze token available: preserve streak
     v_new_streak := v_current_streak + 1;
     v_freeze_used := true;
@@ -861,8 +872,9 @@ CREATE POLICY streaks_select_own ON public.streaks
 CREATE POLICY jobs_select_own ON public.jobs
   FOR SELECT USING (auth.uid() = user_id);
 
+-- System jobs (user_id IS NULL) must be created via service_role only (bypasses RLS)
 CREATE POLICY jobs_insert_own ON public.jobs
-  FOR INSERT WITH CHECK (auth.uid() = user_id);
+  FOR INSERT WITH CHECK (auth.uid()::uuid = user_id);
 
 -- =============================================================================
 -- END OF MIGRATION
