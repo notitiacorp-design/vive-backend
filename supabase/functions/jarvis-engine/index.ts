@@ -1,16 +1,27 @@
-import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
 
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
-};
+const ALLOWED_ORIGINS = (Deno.env.get("ALLOWED_ORIGIN") ?? "https://votre-domaine.com")
+  .split(",")
+  .map((o) => o.trim());
 
-function corsResponse(body: string | null, status = 200) {
+function getCorsHeaders(requestOrigin: string | null): Record<string, string> {
+  const origin =
+    requestOrigin && ALLOWED_ORIGINS.includes(requestOrigin)
+      ? requestOrigin
+      : ALLOWED_ORIGINS[0];
+  return {
+    "Access-Control-Allow-Origin": origin,
+    "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Vary": "Origin",
+  };
+}
+
+function corsResponse(body: string | null, status = 200, requestOrigin: string | null = null) {
   return new Response(body, {
     status,
-    headers: { ...corsHeaders, "Content-Type": "application/json" },
+    headers: { ...getCorsHeaders(requestOrigin), "Content-Type": "application/json" },
   });
 }
 
@@ -61,6 +72,9 @@ type BottleneckKey =
   | "stress_eleve"
   | "manque_activite";
 
+const VALID_CATEGORIES = ["sommeil", "activite", "stress", "nutrition", "respiration", "meditation"] as const;
+const VALID_DIFFICULTIES = ["facile", "moyen", "difficile"] as const;
+
 function analyzeBottleneck(aggregates: HealthAggregate[]): BottleneckKey {
   if (!aggregates || aggregates.length === 0) return "manque_activite";
 
@@ -86,32 +100,26 @@ function analyzeBottleneck(aggregates: HealthAggregate[]): BottleneckKey {
     manque_activite: 0,
   };
 
-  // Deep sleep: less than 60 min is problematic
   if (avgDeepSleep > 0 && avgDeepSleep < 60) {
     scores.sommeil_profond = (60 - avgDeepSleep) / 60;
   }
 
-  // Sleep latency: more than 20 min is problematic
   if (avgLatency > 20) {
     scores.latence_endormissement = Math.min((avgLatency - 20) / 40, 1);
   }
 
-  // Fragmentation: index > 0.3 is problematic
   if (avgFragmentation > 0.3) {
     scores.fragmentation_sommeil = Math.min((avgFragmentation - 0.3) / 0.7, 1);
   }
 
-  // HRV: less than 40ms is problematic
   if (avgHRV > 0 && avgHRV < 40) {
     scores.hrv_faible = (40 - avgHRV) / 40;
   }
 
-  // Stress: more than 60 is problematic
   if (avgStress > 60) {
     scores.stress_eleve = Math.min((avgStress - 60) / 40, 1);
   }
 
-  // Activity: less than 30 active minutes is problematic
   if (avgActive < 30) {
     scores.manque_activite = avgActive === 0 ? 1 : (30 - avgActive) / 30;
   }
@@ -162,13 +170,85 @@ function buildHealthSummary(aggregates: HealthAggregate[]): string {
 - Score de readiness moyen: ${avg(aggregates.map((a) => a.readiness_score))}/100`;
 }
 
+function validateAndSanitizeOpenAIResponse(parsed: unknown): OpenAIResponse {
+  if (typeof parsed !== "object" || parsed === null) {
+    throw new Error("OpenAI response is not an object");
+  }
+
+  const obj = parsed as Record<string, unknown>;
+
+  if (typeof obj.briefing_text !== "string" || obj.briefing_text.trim().length === 0) {
+    throw new Error("Invalid briefing_text in OpenAI response");
+  }
+
+  if (!Array.isArray(obj.missions)) {
+    throw new Error("missions must be an array in OpenAI response");
+  }
+
+  if (obj.missions.length !== 3) {
+    throw new Error(`Expected exactly 3 missions, got ${obj.missions.length}`);
+  }
+
+  const validatedMissions: Mission[] = obj.missions.map((mission: unknown, index: number) => {
+    if (typeof mission !== "object" || mission === null) {
+      throw new Error(`Mission ${index} is not an object`);
+    }
+
+    const m = mission as Record<string, unknown>;
+
+    if (typeof m.title !== "string" || m.title.trim().length === 0) {
+      throw new Error(`Mission ${index}: title is required and must be a string`);
+    }
+    if (typeof m.description !== "string" || m.description.trim().length === 0) {
+      throw new Error(`Mission ${index}: description is required and must be a string`);
+    }
+    if (typeof m.category !== "string") {
+      throw new Error(`Mission ${index}: category must be a string`);
+    }
+    if (typeof m.difficulty !== "string") {
+      throw new Error(`Mission ${index}: difficulty must be a string`);
+    }
+    if (typeof m.xp_reward !== "number" || isNaN(m.xp_reward)) {
+      throw new Error(`Mission ${index}: xp_reward must be a number`);
+    }
+
+    const category = m.category.toLowerCase().trim();
+    if (!(VALID_CATEGORIES as readonly string[]).includes(category)) {
+      throw new Error(`Mission ${index}: invalid category '${category}'. Must be one of: ${VALID_CATEGORIES.join(", ")}`);
+    }
+
+    const difficulty = m.difficulty.toLowerCase().trim();
+    if (!(VALID_DIFFICULTIES as readonly string[]).includes(difficulty)) {
+      throw new Error(`Mission ${index}: invalid difficulty '${difficulty}'. Must be one of: ${VALID_DIFFICULTIES.join(", ")}`);
+    }
+
+    const xp_reward = Math.round(m.xp_reward);
+    if (xp_reward < 50 || xp_reward > 200) {
+      throw new Error(`Mission ${index}: xp_reward must be between 50 and 200, got ${xp_reward}`);
+    }
+
+    return {
+      title: m.title.trim().substring(0, 50),
+      description: m.description.trim().substring(0, 200),
+      category,
+      difficulty,
+      xp_reward,
+    };
+  });
+
+  return {
+    briefing_text: obj.briefing_text.trim().substring(0, 2000),
+    missions: validatedMissions,
+  };
+}
+
 async function callOpenAI(
   healthSummary: string,
   bottleneck: BottleneckKey,
   jarvisState: JarvisState | null,
   openaiKey: string
 ): Promise<OpenAIResponse> {
-  const systemPrompt = `Tu es JARVIS, un coach de santÃ© expert et bienveillant qui s'exprime en franÃ§ais. 
+  const systemPrompt = `Tu es JARVIS, un coach de santÃ© expert et bienveillant qui s'exprime en franÃ§ais.
 Tu analyses les donnÃ©es de santÃ© de l'utilisateur et tu crÃ©es des briefings personnalisÃ©s, encourageants et motivants.
 Tu es prÃ©cis, scientifique mais accessible, et tu adaptes tes recommandations au profil unique de chaque personne.
 Tu gÃ©nÃ¨res toujours une rÃ©ponse JSON valide avec les champs demandÃ©s.`;
@@ -206,49 +286,59 @@ Format JSON requis:
   ]
 }`;
 
-  const response = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${openaiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "gpt-4o-mini",
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userMessage },
-      ],
-      temperature: 0.7,
-      max_tokens: 1200,
-      response_format: { type: "json_object" },
-    }),
-  });
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 30000);
 
-  if (!response.ok) {
-    const error = await response.text();
-    throw new Error(`OpenAI API error: ${response.status} - ${error}`);
+  try {
+    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${openaiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userMessage },
+        ],
+        temperature: 0.7,
+        max_tokens: 1200,
+        response_format: { type: "json_object" },
+      }),
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      const error = await response.text();
+      throw new Error(`OpenAI API error: ${response.status} - ${error}`);
+    }
+
+    const data = await response.json();
+    const content = data.choices?.[0]?.message?.content;
+    if (!content) throw new Error("No content in OpenAI response");
+
+    const parsed: unknown = JSON.parse(content);
+    return validateAndSanitizeOpenAIResponse(parsed);
+  } catch (err) {
+    if (err instanceof Error && err.name === "AbortError") {
+      throw new Error("OpenAI API call timed out after 30 seconds");
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeoutId);
   }
-
-  const data = await response.json();
-  const content = data.choices?.[0]?.message?.content;
-  if (!content) throw new Error("No content in OpenAI response");
-
-  const parsed: OpenAIResponse = JSON.parse(content);
-
-  if (!parsed.briefing_text || !Array.isArray(parsed.missions)) {
-    throw new Error("Invalid OpenAI response structure");
-  }
-
-  return parsed;
 }
 
 serve(async (req: Request) => {
+  const requestOrigin = req.headers.get("origin");
+
   if (req.method === "OPTIONS") {
-    return new Response(null, { headers: corsHeaders });
+    return new Response(null, { headers: getCorsHeaders(requestOrigin) });
   }
 
   if (req.method !== "POST") {
-    return corsResponse(JSON.stringify({ error: "Method not allowed" }), 405);
+    return corsResponse(JSON.stringify({ error: "Method not allowed" }), 405, requestOrigin);
   }
 
   try {
@@ -257,58 +347,97 @@ serve(async (req: Request) => {
     const openaiKey = Deno.env.get("OPENAI_API_KEY");
 
     if (!supabaseUrl || !serviceRoleKey) {
-      return corsResponse(JSON.stringify({ error: "Missing Supabase configuration" }), 500);
+      throw new Error("Missing required environment variable: SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
     }
 
     if (!openaiKey) {
-      return corsResponse(JSON.stringify({ error: "Missing OpenAI API key" }), 500);
+      throw new Error("Missing required environment variable: OPENAI_API_KEY");
     }
 
     const supabase = createClient(supabaseUrl, serviceRoleKey, {
       auth: { persistSession: false },
     });
 
+    // Step 0: Verify JWT authentication
+    const authHeader = req.headers.get("Authorization");
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      return corsResponse(
+        JSON.stringify({ error: "Unauthorized: missing or invalid Authorization header" }),
+        401,
+        requestOrigin
+      );
+    }
+
+    const token = authHeader.replace("Bearer ", "");
+    const { data: { user: authenticatedUser }, error: authError } = await supabase.auth.getUser(token);
+
+    if (authError || !authenticatedUser) {
+      return corsResponse(
+        JSON.stringify({ error: "Unauthorized: invalid or expired token" }),
+        401,
+        requestOrigin
+      );
+    }
+
     let user_id: string;
     try {
       const body = await req.json();
       user_id = body.user_id;
     } catch {
-      return corsResponse(JSON.stringify({ error: "Invalid JSON body" }), 400);
+      return corsResponse(JSON.stringify({ error: "Invalid JSON body" }), 400, requestOrigin);
     }
 
     if (!user_id || typeof user_id !== "string") {
-      return corsResponse(JSON.stringify({ error: "user_id is required" }), 400);
+      return corsResponse(JSON.stringify({ error: "user_id is required" }), 400, requestOrigin);
     }
 
-    // Step 1: Fetch last 7 days of health aggregates
+    // Verify the authenticated user matches the requested user_id
+    if (authenticatedUser.id !== user_id) {
+      return corsResponse(
+        JSON.stringify({ error: "Forbidden: you can only access your own data" }),
+        403,
+        requestOrigin
+      );
+    }
+
+    // Opaque log identifier for RGPD compliance
+    const logId = user_id.substring(0, 8) + "...";
+
+    const warnings: string[] = [];
+
+    // Step 1: Fetch last 7 days of health aggregates (explicit columns)
     const sevenDaysAgo = new Date();
     sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
     const sevenDaysAgoStr = sevenDaysAgo.toISOString().split("T")[0];
 
     const { data: aggregates, error: aggregatesError } = await supabase
       .from("health_daily_aggregates")
-      .select("*")
+      .select(
+        "date,user_id,deep_sleep_minutes,sleep_latency_minutes,sleep_fragmentation_index,hrv_rmssd,stress_score,active_minutes,steps,total_sleep_minutes,sleep_score,readiness_score"
+      )
       .eq("user_id", user_id)
       .gte("date", sevenDaysAgoStr)
       .order("date", { ascending: false });
 
     if (aggregatesError) {
-      console.error("Error fetching health aggregates:", aggregatesError);
+      console.error(`[${logId}] Error fetching health aggregates:`, aggregatesError.message);
       return corsResponse(
         JSON.stringify({ error: "Failed to fetch health data", details: aggregatesError.message }),
-        500
+        500,
+        requestOrigin
       );
     }
 
-    // Step 2: Fetch current jarvis_state
+    // Step 2: Fetch current jarvis_state (explicit columns)
     const { data: jarvisStateData, error: jarvisError } = await supabase
       .from("jarvis_states")
-      .select("*")
+      .select("id,user_id,current_bottleneck,active_objective,last_analysis,context,streak_days,total_xp")
       .eq("user_id", user_id)
       .maybeSingle();
 
     if (jarvisError) {
-      console.error("Error fetching jarvis state:", jarvisError);
+      console.error(`[${logId}] Error fetching jarvis state:`, jarvisError.message);
+      warnings.push("jarvis_state_fetch_degraded");
     }
 
     const jarvisState: JarvisState | null = jarvisStateData;
@@ -318,17 +447,19 @@ serve(async (req: Request) => {
     const bottleneck = analyzeBottleneck(healthAggregates);
     const healthSummary = buildHealthSummary(healthAggregates);
 
-    console.log(`User ${user_id}: Bottleneck identified as ${bottleneck}`);
+    console.log(`[${logId}] JARVIS engine: bottleneck=${bottleneck}, data_points=${healthAggregates.length}`);
 
     // Step 4: Call OpenAI
     let openAIResult: OpenAIResponse;
     try {
       openAIResult = await callOpenAI(healthSummary, bottleneck, jarvisState, openaiKey);
     } catch (err) {
-      console.error("OpenAI error:", err);
+      const errMsg = err instanceof Error ? err.message : String(err);
+      console.error(`[${logId}] OpenAI error: ${errMsg}`);
       return corsResponse(
-        JSON.stringify({ error: "Failed to generate briefing", details: String(err) }),
-        500
+        JSON.stringify({ error: "Failed to generate briefing", details: errMsg }),
+        500,
+        requestOrigin
       );
     }
 
@@ -353,13 +484,14 @@ serve(async (req: Request) => {
     const { data: insertedMissions, error: missionsError } = await supabase
       .from("missions")
       .insert(missionsToInsert)
-      .select();
+      .select("id,user_id,title,description,category,difficulty,xp_reward,status,assigned_date,source,bottleneck_target,created_at");
 
     if (missionsError) {
-      console.error("Error inserting missions:", missionsError);
+      console.error(`[${logId}] Error inserting missions:`, missionsError.message);
       return corsResponse(
         JSON.stringify({ error: "Failed to store missions", details: missionsError.message }),
-        500
+        500,
+        requestOrigin
       );
     }
 
@@ -367,7 +499,6 @@ serve(async (req: Request) => {
     const activeObjective = `AmÃ©liorer: ${bottleneckLabel(bottleneck)}`;
     const contextData = {
       last_bottleneck: bottleneck,
-      health_summary: healthSummary,
       briefing_date: today,
       missions_count: openAIResult.missions.length,
       aggregates_count: healthAggregates.length,
@@ -387,8 +518,8 @@ serve(async (req: Request) => {
       .upsert(upsertData, { onConflict: "user_id" });
 
     if (upsertError) {
-      console.error("Error updating jarvis state:", upsertError);
-      // Non-fatal: continue
+      console.error(`[${logId}] Error updating jarvis state:`, upsertError.message);
+      warnings.push("jarvis_state_update_failed");
     }
 
     // Step 7: Return response
@@ -402,15 +533,18 @@ serve(async (req: Request) => {
       active_objective: activeObjective,
       analysis_date: now,
       health_data_points: healthAggregates.length,
+      ...(warnings.length > 0 ? { warnings } : {}),
     };
 
-    console.log(`JARVIS engine completed for user ${user_id}`);
-    return corsResponse(JSON.stringify(responsePayload), 200);
+    console.log(`[${logId}] JARVIS engine completed successfully`);
+    return corsResponse(JSON.stringify(responsePayload), 200, requestOrigin);
   } catch (err) {
-    console.error("Unexpected error in jarvis-engine:", err);
+    const errMsg = err instanceof Error ? err.message : String(err);
+    console.error("Unexpected error in jarvis-engine:", errMsg);
     return corsResponse(
-      JSON.stringify({ error: "Internal server error", details: String(err) }),
-      500
+      JSON.stringify({ error: "Internal server error", details: errMsg }),
+      500,
+      requestOrigin
     );
   }
 });
