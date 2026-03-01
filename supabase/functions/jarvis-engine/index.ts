@@ -5,6 +5,25 @@ const ALLOWED_ORIGINS = (Deno.env.get("ALLOWED_ORIGIN") ?? "https://votre-domain
   .split(",")
   .map((o) => o.trim());
 
+// Rate limiting: in-memory store per user (resets on cold start)
+const rateLimitMap = new Map<string, { count: number; windowStart: number }>();
+const RATE_LIMIT_WINDOW_MS = 60_000; // 1 minute
+const RATE_LIMIT_MAX_CALLS = 3;
+
+function checkRateLimit(userId: string): boolean {
+  const now = Date.now();
+  const entry = rateLimitMap.get(userId);
+  if (!entry || now - entry.windowStart > RATE_LIMIT_WINDOW_MS) {
+    rateLimitMap.set(userId, { count: 1, windowStart: now });
+    return true;
+  }
+  if (entry.count >= RATE_LIMIT_MAX_CALLS) {
+    return false;
+  }
+  entry.count += 1;
+  return true;
+}
+
 function getCorsHeaders(requestOrigin: string | null): Record<string, string> {
   const origin =
     requestOrigin && ALLOWED_ORIGINS.includes(requestOrigin)
@@ -21,8 +40,17 @@ function getCorsHeaders(requestOrigin: string | null): Record<string, string> {
 function corsResponse(body: string | null, status = 200, requestOrigin: string | null = null) {
   return new Response(body, {
     status,
-    headers: { ...getCorsHeaders(requestOrigin), "Content-Type": "application/json" },
+    headers: { ...getCorsHeaders(requestOrigin), "Content-Type": "application/json; charset=utf-8" },
   });
+}
+
+// Robust log ID: use a simple hash to avoid correlation in small user sets
+async function hashUserId(userId: string): Promise<string> {
+  const encoder = new TextEncoder();
+  const data = encoder.encode(userId);
+  const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.slice(0, 8).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 interface HealthAggregate {
@@ -141,17 +169,17 @@ function analyzeBottleneck(aggregates: HealthAggregate[]): BottleneckKey {
 function bottleneckLabel(key: BottleneckKey): string {
   const labels: Record<BottleneckKey, string> = {
     sommeil_profond: "manque de sommeil profond",
-    latence_endormissement: "latence d'endormissement Ã©levÃ©e",
+    latence_endormissement: "latence d\u2019endormissement \u00e9lev\u00e9e",
     fragmentation_sommeil: "fragmentation du sommeil",
-    hrv_faible: "variabilitÃ© cardiaque faible (HRV)",
-    stress_eleve: "niveau de stress Ã©levÃ©",
-    manque_activite: "manque d'activitÃ© physique",
+    hrv_faible: "variabilit\u00e9 cardiaque faible (HRV)",
+    stress_eleve: "niveau de stress \u00e9lev\u00e9",
+    manque_activite: "manque d\u2019activit\u00e9 physique",
   };
   return labels[key];
 }
 
 function buildHealthSummary(aggregates: HealthAggregate[]): string {
-  if (!aggregates || aggregates.length === 0) return "Aucune donnÃ©e de santÃ© disponible.";
+  if (!aggregates || aggregates.length === 0) return "Aucune donn\u00e9e de sant\u00e9 disponible.";
 
   const avg = (arr: (number | undefined)[]): string => {
     const valid = arr.filter((v): v is number => v !== undefined && v !== null);
@@ -159,17 +187,7 @@ function buildHealthSummary(aggregates: HealthAggregate[]): string {
     return (valid.reduce((a, b) => a + b, 0) / valid.length).toFixed(1);
   };
 
-  return `RÃ©sumÃ© des 7 derniers jours:
-- Sommeil profond moyen: ${avg(aggregates.map((a) => a.deep_sleep_minutes))} min
-- Latence d'endormissement moyenne: ${avg(aggregates.map((a) => a.sleep_latency_minutes))} min
-- Index de fragmentation moyen: ${avg(aggregates.map((a) => a.sleep_fragmentation_index))}
-- HRV (RMSSD) moyen: ${avg(aggregates.map((a) => a.hrv_rmssd))} ms
-- Score de stress moyen: ${avg(aggregates.map((a) => a.stress_score))}/100
-- Minutes d'activitÃ© moyennes: ${avg(aggregates.map((a) => a.active_minutes))} min
-- Pas moyens: ${avg(aggregates.map((a) => a.steps))}
-- DurÃ©e totale de sommeil moyenne: ${avg(aggregates.map((a) => a.total_sleep_minutes))} min
-- Score de sommeil moyen: ${avg(aggregates.map((a) => a.sleep_score))}/100
-- Score de readiness moyen: ${avg(aggregates.map((a) => a.readiness_score))}/100`;
+  return `R\u00e9sum\u00e9 des 7 derniers jours:\n- Sommeil profond moyen: ${avg(aggregates.map((a) => a.deep_sleep_minutes))} min\n- Latence d\u2019endormissement moyenne: ${avg(aggregates.map((a) => a.sleep_latency_minutes))} min\n- Index de fragmentation moyen: ${avg(aggregates.map((a) => a.sleep_fragmentation_index))}\n- HRV (RMSSD) moyen: ${avg(aggregates.map((a) => a.hrv_rmssd))} ms\n- Score de stress moyen: ${avg(aggregates.map((a) => a.stress_score))}/100\n- Minutes d\u2019activit\u00e9 moyennes: ${avg(aggregates.map((a) => a.active_minutes))} min\n- Pas moyens: ${avg(aggregates.map((a) => a.steps))}\n- Dur\u00e9e totale de sommeil moyenne: ${avg(aggregates.map((a) => a.total_sleep_minutes))} min\n- Score de sommeil moyen: ${avg(aggregates.map((a) => a.sleep_score))}/100\n- Score de readiness moyen: ${avg(aggregates.map((a) => a.readiness_score))}/100`;
 }
 
 function validateAndSanitizeOpenAIResponse(parsed: unknown): OpenAIResponse {
@@ -250,43 +268,17 @@ async function callOpenAI(
   jarvisState: JarvisState | null,
   openaiKey: string
 ): Promise<OpenAIResponse> {
-  const systemPrompt = `Tu es JARVIS, un coach de santÃ© expert et bienveillant qui s'exprime en franÃ§ais.
-Tu analyses les donnÃ©es de santÃ© de l'utilisateur et tu crÃ©es des briefings personnalisÃ©s, encourageants et motivants.
-Tu es prÃ©cis, scientifique mais accessible, et tu adaptes tes recommandations au profil unique de chaque personne.
-Tu gÃ©nÃ¨res toujours une rÃ©ponse JSON valide avec les champs demandÃ©s.`;
+  const systemPrompt = `Tu es JARVIS, un coach de sant\u00e9 expert et bienveillant qui s\u2019exprime en fran\u00e7ais.\nTu analyses les donn\u00e9es de sant\u00e9 de l\u2019utilisateur et tu cr\u00e9es des briefings personnalis\u00e9s, encourageants et motivants.\nTu es pr\u00e9cis, scientifique mais accessible, et tu adaptes tes recommandations au profil unique de chaque personne.\nTu g\u00e9n\u00e8res toujours une r\u00e9ponse JSON valide avec les champs demand\u00e9s.`;
 
   const streakInfo = jarvisState?.streak_days
-    ? `L'utilisateur est en sÃ©rie de ${jarvisState.streak_days} jours consÃ©cutifs.`
+    ? `L\u2019utilisateur est en s\u00e9rie de ${jarvisState.streak_days} jours cons\u00e9cutifs.`
     : "";
   const xpInfo = jarvisState?.total_xp ? `XP total: ${jarvisState.total_xp} points.` : "";
   const previousObjective = jarvisState?.active_objective
-    ? `Objectif prÃ©cÃ©dent: ${jarvisState.active_objective}`
+    ? `Objectif pr\u00e9c\u00e9dent: ${jarvisState.active_objective}`
     : "";
 
-  const userMessage = `${healthSummary}
-
-Principal point d'amÃ©lioration identifiÃ©: ${bottleneckLabel(bottleneck)}
-${streakInfo}
-${xpInfo}
-${previousObjective}
-
-GÃ©nÃ¨re un briefing quotidien personnalisÃ© en JSON avec:
-1. Un texte de briefing motivant et personnalisÃ© (briefing_text) - 3 Ã  5 phrases, chaleureux et encourageant
-2. Exactement 3 missions concrÃ¨tes et rÃ©alisables aujourd'hui (missions) qui adressent principalement le point d'amÃ©lioration identifiÃ©
-
-Format JSON requis:
-{
-  "briefing_text": "string",
-  "missions": [
-    {
-      "title": "string (court, max 50 chars)",
-      "description": "string (instructions claires, max 200 chars)",
-      "category": "string (une parmi: sommeil, activite, stress, nutrition, respiration, meditation)",
-      "difficulty": "string (une parmi: facile, moyen, difficile)",
-      "xp_reward": number (entre 50 et 200)
-    }
-  ]
-}`;
+  const userMessage = `${healthSummary}\n\nPrincipal point d\u2019am\u00e9lioration identifi\u00e9: ${bottleneckLabel(bottleneck)}\n${streakInfo}\n${xpInfo}\n${previousObjective}\n\nG\u00e9n\u00e8re un briefing quotidien personnalis\u00e9 en JSON avec:\n1. Un texte de briefing motivant et personnalis\u00e9 (briefing_text) - 3 \u00e0 5 phrases, chaleureux et encourageant\n2. Exactement 3 missions concr\u00e8tes et r\u00e9alisables aujourd\u2019hui (missions) qui adressent principalement le point d\u2019am\u00e9lioration identifi\u00e9\n\nFormat JSON requis:\n{\n  "briefing_text": "string",\n  "missions": [\n    {\n      "title": "string (court, max 50 chars)",\n      "description": "string (instructions claires, max 200 chars)",\n      "category": "string (une parmi: sommeil, activite, stress, nutrition, respiration, meditation)",\n      "difficulty": "string (une parmi: facile, moyen, difficile)",\n      "xp_reward": number (entre 50 et 200)\n    }\n  ]\n}`;
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 30000);
@@ -312,8 +304,10 @@ Format JSON requis:
     });
 
     if (!response.ok) {
-      const error = await response.text();
-      throw new Error(`OpenAI API error: ${response.status} - ${error}`);
+      // Read and discard the raw error body without forwarding sensitive details
+      const _rawError = await response.text();
+      // Only expose status code to the error chain, never the raw body
+      throw new Error(`OpenAI API error: HTTP ${response.status}`);
     }
 
     const data = await response.json();
@@ -424,16 +418,30 @@ serve(async (req: Request) => {
       );
     }
 
-    // Opaque log identifier for RGPD compliance
-    const logId = user_id.substring(0, 8) + "...";
+    // Opaque log identifier using a hash for RGPD compliance
+    const logId = await hashUserId(user_id);
+
+    // Rate limiting: prevent repeated expensive calls within the same window
+    if (!checkRateLimit(user_id)) {
+      console.warn(`[${logId}] Rate limit exceeded`);
+      return corsResponse(
+        JSON.stringify({ error: "Too many requests. Please wait before calling again.", code: "RATE_LIMITED" }),
+        429,
+        requestOrigin
+      );
+    }
 
     const warnings: string[] = [];
 
-    // Step 1: Fetch last 7 days of health aggregates (explicit columns)
+    // Step 1: Fetch last 7 days of health aggregates (explicit columns, explicit limit)
     const sevenDaysAgo = new Date(NOW);
     sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
     const sevenDaysAgoStr = sevenDaysAgo.toISOString().split("T")[0];
 
+    // NOTE: Ensure the following indexes exist in your database for performance and correctness:
+    //   CREATE INDEX IF NOT EXISTS idx_health_daily_aggregates_user_date ON health_daily_aggregates(user_id, date);
+    //   CREATE UNIQUE INDEX IF NOT EXISTS idx_jarvis_states_user_id ON jarvis_states(user_id);
+    // The upsert on jarvis_states uses onConflict: 'user_id', which requires a unique index on user_id.
     const { data: aggregates, error: aggregatesError } = await supabase
       .from("health_daily_aggregates")
       .select(
@@ -441,7 +449,8 @@ serve(async (req: Request) => {
       )
       .eq("user_id", user_id)
       .gte("date", sevenDaysAgoStr)
-      .order("date", { ascending: false });
+      .order("date", { ascending: false })
+      .limit(7);
 
     if (aggregatesError) {
       console.error(`[${logId}] Error fetching health aggregates:`, aggregatesError.message);
@@ -472,6 +481,33 @@ serve(async (req: Request) => {
     const healthSummary = buildHealthSummary(healthAggregates);
 
     console.log(`[${logId}] JARVIS engine: bottleneck=${bottleneck}, data_points=${healthAggregates.length}`);
+
+    // Step 3b: Idempotency check â if missions already exist for this user+date, return them
+    const { data: existingMissions, error: existingError } = await supabase
+      .from("missions")
+      .select("id,user_id,title,description,category,difficulty,xp_reward,status,assigned_date,source,bottleneck_target,created_at")
+      .eq("user_id", user_id)
+      .eq("assigned_date", today)
+      .eq("source", "jarvis")
+      .limit(10);
+
+    if (!existingError && existingMissions && existingMissions.length >= 3) {
+      console.log(`[${logId}] Idempotency: missions already exist for today, returning cached result`);
+      // Fetch jarvis state for active_objective
+      const activeObj = jarvisState?.active_objective ?? `Am\u00e9liorer: ${bottleneckLabel(bottleneck)}`;
+      const cachedPayload = {
+        success: true,
+        bottleneck: jarvisState?.current_bottleneck ?? bottleneck,
+        bottleneck_label: bottleneckLabel((jarvisState?.current_bottleneck as BottleneckKey) ?? bottleneck),
+        briefing_text: null,
+        missions: existingMissions,
+        active_objective: activeObj,
+        analysis_date: jarvisState?.last_analysis ?? now,
+        health_data_points: healthAggregates.length,
+        idempotent: true,
+      };
+      return corsResponse(JSON.stringify(cachedPayload), 200, requestOrigin);
+    }
 
     // Step 4: Call OpenAI
     let openAIResult: OpenAIResponse;
@@ -515,8 +551,18 @@ serve(async (req: Request) => {
       );
     }
 
+    // Verify that the expected number of missions was inserted
+    const finalMissions = insertedMissions ?? [];
+    if (finalMissions.length !== 3) {
+      console.warn(`[${logId}] Expected 3 inserted missions, got ${finalMissions.length}. Falling back to missionsToInsert.`);
+      // Emit a monitoring warning for alerting systems
+      warnings.push("missions_insert_count_mismatch");
+    }
+
+    const missionsResult = finalMissions.length === 3 ? finalMissions : missionsToInsert;
+
     // Step 6: Update jarvis_states
-    const activeObjective = `AmÃ©liorer: ${bottleneckLabel(bottleneck)}`;
+    const activeObjective = `Am\u00e9liorer: ${bottleneckLabel(bottleneck)}`;
     const contextData = {
       last_bottleneck: bottleneck,
       briefing_date: today,
@@ -540,6 +586,13 @@ serve(async (req: Request) => {
     if (upsertError) {
       console.error(`[${logId}] Error updating jarvis state:`, upsertError.message);
       warnings.push("jarvis_state_update_failed");
+      // Emit alerting hook for monitoring: log a structured warning that can be picked up by log aggregators
+      console.warn(JSON.stringify({
+        alert: "jarvis_state_update_failed",
+        logId,
+        timestamp: now,
+        error: upsertError.message,
+      }));
     }
 
     // Step 7: Return response
@@ -548,7 +601,7 @@ serve(async (req: Request) => {
       bottleneck,
       bottleneck_label: bottleneckLabel(bottleneck),
       briefing_text: openAIResult.briefing_text,
-      missions: insertedMissions || missionsToInsert,
+      missions: missionsResult,
       active_objective: activeObjective,
       analysis_date: now,
       health_data_points: healthAggregates.length,
