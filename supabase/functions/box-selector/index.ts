@@ -1,14 +1,43 @@
 import { serve } from 'https://deno.land/std@0.208.0/http/server.ts'
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.39.0'
 
-const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
-  'Access-Control-Allow-Methods': 'POST, OPTIONS',
+// CORS: restrict to allowed origins via environment variable instead of wildcard
+const ALLOWED_ORIGIN = Deno.env.get('ALLOWED_ORIGIN') || ''
+
+function getCorsHeaders(requestOrigin: string | null): Record<string, string> {
+  const allowed = ALLOWED_ORIGIN || ''
+  const origin =
+    allowed && requestOrigin && requestOrigin === allowed
+      ? requestOrigin
+      : allowed || 'null'
+  return {
+    'Access-Control-Allow-Origin': origin,
+    'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+    'Access-Control-Allow-Methods': 'POST, OPTIONS',
+  }
 }
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const MONTH_YEAR_REGEX = /^\d{4}-\d{2}$/
+
+// Rate limiting: simple in-memory store (resets on cold start)
+const rateLimitStore = new Map<string, { count: number; resetAt: number }>()
+const RATE_LIMIT_MAX = 10
+const RATE_LIMIT_WINDOW_MS = 60_000
+
+function isRateLimited(key: string): boolean {
+  const now = Date.now()
+  const entry = rateLimitStore.get(key)
+  if (!entry || now >= entry.resetAt) {
+    rateLimitStore.set(key, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS })
+    return false
+  }
+  if (entry.count >= RATE_LIMIT_MAX) {
+    return true
+  }
+  entry.count++
+  return false
+}
 
 const BOTTLENECK_TO_CATEGORY: Record<string, string> = {
   sommeil_profond: 'sleep',
@@ -49,7 +78,8 @@ const MYSTERY_JUSTIFICATIONS: Record<string, string> = {
   energy: "dÃ©couvrir des sources d'Ã©nergie naturelles inÃ©dites pour dynamiser votre quotidien",
 }
 
-const DEBUG = Deno.env.get('DEBUG') === 'true'
+// DEBUG: only enable in non-production environments
+const DEBUG = Deno.env.get('DEBUG') === 'true' && Deno.env.get('ENVIRONMENT') !== 'production'
 
 // Codes SQLSTATE personnalisÃ©s attendus de la RPC PostgreSQL
 const PG_RAISE_EXCEPTION_CODE = 'P0001'
@@ -59,11 +89,29 @@ const PG_UNIQUE_VIOLATION_CODE = '23505'
 const RPC_ERROR_DUPLICATE_ORDER = 'duplicate_order'
 const RPC_ERROR_INSUFFICIENT_STOCK = 'insufficient_stock'
 
+// Pagination constants
+const PAST_ORDERS_LIMIT = 500
+const MODULES_LIMIT = 200
+
+// Max allowed year for month_year
+const MAX_YEAR = 2100
+
 /**
  * Anonymise un user_id pour les logs (conserve les 8 premiers caractÃ¨res).
  */
 function anonymizeUserId(userId: string): string {
   return userId.substring(0, 8) + '********'
+}
+
+/**
+ * Shared deterministic index function extracted to avoid duplication.
+ */
+function deterministicIndex(pool: Record<string, unknown>[], seed: string): number {
+  let hash = 0
+  for (let i = 0; i < seed.length; i++) {
+    hash = (hash * 31 + seed.charCodeAt(i)) >>> 0
+  }
+  return hash % pool.length
 }
 
 /**
@@ -85,10 +133,11 @@ function parseRpcErrorMessage(message: string): Record<string, unknown> | null {
 function errorResponse(
   message: string,
   status: number,
+  corsHeaders: Record<string, string>,
   internalDetails?: unknown
 ): Response {
   if (internalDetails) {
-    console.error(`[box-selector] ${message}:`, internalDetails)
+    console.error(`[box-selector] ${message}: [details hidden]`)
   }
   const body: Record<string, unknown> = { error: message }
   if (DEBUG && internalDetails) {
@@ -103,12 +152,21 @@ function errorResponse(
 }
 
 serve(async (req: Request) => {
+  const requestOrigin = req.headers.get('origin')
+  const corsHeaders = getCorsHeaders(requestOrigin)
+
   if (req.method === 'OPTIONS') {
     return new Response('ok', { headers: corsHeaders })
   }
 
   if (req.method !== 'POST') {
-    return errorResponse('Method not allowed', 405)
+    return errorResponse('Method not allowed', 405, corsHeaders)
+  }
+
+  // Validate Content-Type
+  const contentType = req.headers.get('content-type') || ''
+  if (!contentType.includes('application/json')) {
+    return errorResponse('Content-Type must be application/json', 415, corsHeaders)
   }
 
   try {
@@ -122,18 +180,18 @@ serve(async (req: Request) => {
     // --- Authentification et autorisation ---
     const authHeader = req.headers.get('authorization')
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return errorResponse('Missing or invalid authorization header', 401)
+      return errorResponse('Missing or invalid authorization header', 401, corsHeaders)
     }
     const callerJwt = authHeader.replace('Bearer ', '').trim()
 
-    // Client authentifiÃ© pour vÃ©rifier l'identitÃ© du caller
-    const supabaseAuth = createClient(supabaseUrl, supabaseServiceKey, {
+    // Single Supabase client (service role) for all operations
+    const supabase = createClient(supabaseUrl, supabaseServiceKey, {
       auth: { autoRefreshToken: false, persistSession: false },
     })
 
-    const { data: callerData, error: callerError } = await supabaseAuth.auth.getUser(callerJwt)
+    const { data: callerData, error: callerError } = await supabase.auth.getUser(callerJwt)
     if (callerError || !callerData?.user) {
-      return errorResponse('Unauthorized: invalid token', 401, callerError)
+      return errorResponse('Unauthorized: invalid token', 401, corsHeaders, callerError)
     }
 
     const callerUser = callerData.user
@@ -141,41 +199,41 @@ serve(async (req: Request) => {
       callerUser.app_metadata?.role === 'admin' ||
       callerUser.app_metadata?.claims_admin === true
 
-    // Client service role pour les opÃ©rations DB
-    const supabase = createClient(supabaseUrl, supabaseServiceKey, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    })
+    // Rate limit by caller user id
+    if (isRateLimited(callerUser.id)) {
+      return errorResponse('Too many requests', 429, corsHeaders)
+    }
 
     // --- Parse body ---
     let body: { user_id?: string; month_year?: string }
     try {
       body = await req.json()
     } catch {
-      return errorResponse('Invalid JSON body', 400)
+      return errorResponse('Invalid JSON body', 400, corsHeaders)
     }
 
     const { user_id, month_year } = body
 
     if (!user_id || typeof user_id !== 'string') {
-      return errorResponse('user_id is required and must be a string', 400)
+      return errorResponse('user_id is required and must be a string', 400, corsHeaders)
     }
 
     // Validation UUID pour user_id
     if (!UUID_REGEX.test(user_id)) {
-      return errorResponse('user_id must be a valid UUID', 400)
+      return errorResponse('user_id must be a valid UUID', 400, corsHeaders)
     }
 
     // VÃ©rifier que le caller est bien l'utilisateur concernÃ© ou un admin
     if (!isAdmin && callerUser.id !== user_id) {
-      return errorResponse('Forbidden: you can only create box orders for your own account', 403)
+      return errorResponse('Forbidden: you can only create box orders for your own account', 403, corsHeaders)
     }
 
     if (!month_year || typeof month_year !== 'string') {
-      return errorResponse('month_year is required (format: YYYY-MM)', 400)
+      return errorResponse('month_year is required (format: YYYY-MM)', 400, corsHeaders)
     }
 
     if (!MONTH_YEAR_REGEX.test(month_year)) {
-      return errorResponse('month_year must be in format YYYY-MM (e.g. 2025-03)', 400)
+      return errorResponse('month_year must be in format YYYY-MM (e.g. 2025-03)', 400, corsHeaders)
     }
 
     // Validation du mois et de l'annÃ©e
@@ -186,20 +244,28 @@ serve(async (req: Request) => {
       isNaN(parsedDate.getTime()) ||
       monthNum < 1 ||
       monthNum > 12 ||
-      yearNum < 2020
+      yearNum < 2020 ||
+      yearNum > MAX_YEAR
     ) {
-      return errorResponse('month_year contains an invalid month or year value', 400)
+      return errorResponse('month_year contains an invalid month or year value', 400, corsHeaders)
     }
 
-    // --- Step 1: Fetch user profile and jarvis_state ---
+    // Validate month_year is not in the past (allow current month and future)
+    const now = new Date()
+    const currentYearMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`
+    if (month_year < currentYearMonth) {
+      return errorResponse('month_year cannot be in the past', 400, corsHeaders)
+    }
+
+    // --- Step 1: Fetch user profile and jarvis_state (exclude email - not needed) ---
     const { data: profile, error: profileError } = await supabase
       .from('profiles')
-      .select('id, full_name, email, jarvis_state')
+      .select('id, full_name, jarvis_state')
       .eq('id', user_id)
       .single()
 
     if (profileError || !profile) {
-      return errorResponse('User not found', 404, profileError)
+      return errorResponse('User not found', 404, corsHeaders, profileError)
     }
 
     const jarvisState = profile.jarvis_state as {
@@ -210,15 +276,18 @@ serve(async (req: Request) => {
     const currentBottleneck = jarvisState?.bottleneck || null
     const currentContext = jarvisState?.context || {}
 
-    // --- Step 2: Fetch past box_orders to get previously sent module IDs ---
+    // --- Step 2: Fetch past box_orders with pagination to get previously sent module IDs ---
     const { data: pastOrders, error: pastOrdersError } = await supabase
       .from('box_orders')
       .select('hero_module_id, mystery_module_id')
       .eq('user_id', user_id)
       .not('status', 'eq', 'cancelled')
+      .limit(PAST_ORDERS_LIMIT)
 
     if (pastOrdersError) {
-      console.error('[box-selector] Error fetching past orders:', pastOrdersError)
+      // Surface error - do not silently continue as it could lead to incorrect module reuse
+      console.error(`[box-selector] Error fetching past orders for user ${anonymizeUserId(user_id)}: [details hidden]`)
+      return errorResponse('Failed to fetch order history', 500, corsHeaders, pastOrdersError)
     }
 
     const previouslyUsedModuleIds = new Set<string>()
@@ -229,20 +298,21 @@ serve(async (req: Request) => {
       }
     }
 
-    // --- Step 3: Fetch available modules (active=true, stock > 0) avec colonnes explicites ---
+    // --- Step 3: Fetch available modules (active=true, stock > 0) with limit ---
     const { data: availableModules, error: modulesError } = await supabase
       .from('modules')
       .select('id, name, category, description, brand, price, image_url, relevance_score, stock, active')
       .eq('active', true)
       .gt('stock', 0)
       .order('relevance_score', { ascending: false })
+      .limit(MODULES_LIMIT)
 
     if (modulesError) {
-      return errorResponse('Failed to fetch modules', 500, modulesError)
+      return errorResponse('Failed to fetch modules', 500, corsHeaders, modulesError)
     }
 
     if (!availableModules || availableModules.length === 0) {
-      return errorResponse('No modules available in stock', 422)
+      return errorResponse('No modules available in stock', 422, corsHeaders)
     }
 
     // Filter out previously used modules
@@ -282,7 +352,7 @@ serve(async (req: Request) => {
     }
 
     if (!heroModule) {
-      return errorResponse('Could not select a hero module: no suitable modules available', 422)
+      return errorResponse('Could not select a hero module: no suitable modules available', 422, corsHeaders)
     }
 
     // --- Step 5: Select mystery_module (different category from hero) ---
@@ -297,16 +367,8 @@ serve(async (req: Request) => {
 
     let mysteryModule: Record<string, unknown> | null = null
 
-    // Fonction de sÃ©lection dÃ©terministe basÃ©e sur user_id et month_year
-    function deterministicIndex(pool: Record<string, unknown>[], seed: string): number {
-      let hash = 0
-      for (let i = 0; i < seed.length; i++) {
-        hash = (hash * 31 + seed.charCodeAt(i)) >>> 0
-      }
-      return hash % pool.length
-    }
-
-    const selectionSeed = `${user_id}-${month_year}`
+    // Use a separator to avoid seed collision: 'user_id::month_year'
+    const selectionSeed = `${user_id}::${month_year}`
 
     if (mysteryPool.length > 0) {
       const topCandidates = mysteryPool.slice(0, Math.min(5, mysteryPool.length))
@@ -326,7 +388,8 @@ serve(async (req: Request) => {
     if (!mysteryModule) {
       return errorResponse(
         'Could not select a mystery module: insufficient distinct modules available',
-        422
+        422,
+        corsHeaders
       )
     }
 
@@ -409,14 +472,14 @@ serve(async (req: Request) => {
         rpcError.code === PG_RAISE_EXCEPTION_CODE &&
         errorCode === RPC_ERROR_INSUFFICIENT_STOCK
       ) {
-        return errorResponse('One or more selected modules are out of stock', 422, rpcError)
+        return errorResponse('One or more selected modules are out of stock', 422, corsHeaders, rpcError)
       }
 
-      return errorResponse('Failed to create box order', 500, rpcError)
+      return errorResponse('Failed to create box order', 500, corsHeaders, rpcError)
     }
 
     if (!rpcResult || !rpcResult.box_order_id) {
-      return errorResponse('Failed to create box order: no ID returned', 500)
+      return errorResponse('Failed to create box order: no ID returned', 500, corsHeaders)
     }
 
     const boxOrderId: string = rpcResult.box_order_id
@@ -470,10 +533,10 @@ serve(async (req: Request) => {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
     })
   } catch (error) {
-    console.error('[box-selector] Unexpected error:', error)
+    console.error('[box-selector] Unexpected error: [details hidden]')
     return new Response(
       JSON.stringify({ error: 'Internal server error' }),
-      { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      { status: 500, headers: { ...getCorsHeaders(req.headers.get('origin')), 'Content-Type': 'application/json' } }
     )
   }
 })
@@ -539,12 +602,11 @@ function buildMysteryJustification(module: Record<string, unknown>, seed: string
     'Votre boÃ®te mystÃ¨re vous rÃ©serve une dÃ©couverte pour',
   ]
 
-  // SÃ©lection dÃ©terministe basÃ©e sur le seed (user_id + month_year)
-  let hash = 0
-  for (let i = 0; i < seed.length; i++) {
-    hash = (hash * 31 + seed.charCodeAt(i)) >>> 0
-  }
-  const introIndex = hash % surpriseIntros.length
+  // SÃ©lection dÃ©terministe basÃ©e sur le seed (user_id + month_year) â shared utility
+  const introIndex = deterministicIndex(
+    surpriseIntros.map((s) => ({ _val: s }) as Record<string, unknown>),
+    seed
+  )
   const selectedIntro = surpriseIntros[introIndex]
 
   return (
